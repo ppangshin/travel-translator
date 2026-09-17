@@ -1,0 +1,80 @@
+/** Web Speech API helpers — structured for more languages later */
+
+export function getSpeechRecognitionConstructor(): (new () => SpeechRecognition) | null {
+  if (typeof window === 'undefined') return null
+  return window.SpeechRecognition ?? window.webkitSpeechRecognition ?? null
+}
+
+export function isSpeechRecognitionSupported(): boolean {
+  return getSpeechRecognitionConstructor() !== null
+}
+
+export interface RecognitionHandlers {
+  onInterim: (text: string) => void
+  onFinal: (text: string) => void
+  onError: (message: string) => void
+  onStart: () => void
+  onEnd: () => void
+}
+
+/**
+ * Create a continuous SpeechRecognition instance.
+ * Caller owns start/stop; we restart on unexpected end while `shouldRun` is true.
+ */
+export function createRecognition(
+  lang: string,
+  handlers: RecognitionHandlers,
+  shouldRun: () => boolean,
+): SpeechRecognition | null {
+  const Ctor = getSpeechRecognitionConstructor()
+  if (!Ctor) return null
+
+  const recognition = new Ctor()
+  recognition.continuous = true
+  recognition.interimResults = true
+  recognition.lang = lang
+  recognition.maxAlternatives = 1
+
+  recognition.onstart = () => handlers.onStart()
+
+  recognition.onresult = (event: SpeechRecognitionEvent) => {
+    let interim = ''
+    let finalText = ''
+    for (let i = event.resultIndex; i < event.results.length; i++) {
+      const result = event.results[i]
+      const transcript = result[0]?.transcript ?? ''
+      if (result.isFinal) finalText += transcript
+      else interim += transcript
+    }
+    if (interim) handlers.onInterim(interim)
+    if (finalText.trim()) handlers.onFinal(finalText.trim())
+  }
+
+  recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
+    const err = event.error
+    if (err === 'aborted' || err === 'no-speech') return
+    if (err === 'not-allowed') {
+      handlers.onError('마이크 권한이 거부되었습니다. 브라우저 설정에서 허용해 주세요.')
+      return
+    }
+    if (err === 'network') {
+      handlers.onError('음성 인식 네트워크 오류가 발생했습니다.')
+      return
+    }
+    handlers.onError(`음성 인식 오류: ${err}`)
+  }
+
+  recognition.onend = () => {
+    handlers.onEnd()
+    // Auto-restart for continuous listening if still supposed to run
+    if (shouldRun()) {
+      try {
+        recognition.start()
+      } catch {
+        // Ignored — may already be starting
+      }
+    }
+  }
+
+  return recognition
+}
