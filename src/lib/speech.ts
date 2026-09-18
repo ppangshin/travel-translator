@@ -1,4 +1,4 @@
-/** Web Speech API — one recording take. The UI translates only after halt(). */
+/** Web Speech API — one recording take until halt(). A pause does not stop the mic. */
 
 export function getSpeechRecognitionConstructor(): (new () => SpeechRecognition) | null {
   if (typeof window === 'undefined') return null
@@ -19,7 +19,7 @@ export interface RecognitionHandlers {
   /**
    * Full transcript of this take so far, interim words included.
    * An engine restart inside the same take does not drop earlier words.
-   * This is not a cue to translate — the caller translates once, after halt().
+   * Not a cue to translate every update. halt() aborts the mic.
    */
   onTranscript: (transcript: string) => void
   onError: (message: string) => void
@@ -97,7 +97,7 @@ function forceAbort(recognition: SpeechRecognition) {
 
 /**
  * One user take: continuous recognition with interim results, until halt().
- * A pause does not stop the mic and does not mean a sentence is finished.
+ * A pause does not stop the mic.
  * If the engine ends on its own, it restarts only while `shouldRun` is still
  * true (the caller's generation) and halt() was not called. Words from those
  * sessions stay on the same transcript.

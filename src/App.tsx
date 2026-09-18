@@ -1,27 +1,68 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { DEFAULT_LISTEN, DEFAULT_TARGET, LANGUAGES } from './lib/languages'
 import { createRecognition, isSpeechRecognitionSupported } from './lib/speech'
 import { translate } from './lib/translate'
 import { Privacy } from './pages/Privacy'
 
 /**
- * Record, then translate once.
- * The mic stays on until the same button is tapped again. Nothing is sent to
- * translate() during the take — no pause timer, no auto-commit. Stop bumps the
- * generation, aborts the mic, and translates that take's full transcript once.
+ * One record control. Interim words stay a quiet source line.
+ * When that phrase has been still for ~1.1s, it becomes one translation line
+ * and is translated once. The mic stays on; the next words start a new line.
+ * Stop bumps the generation, halt() aborts the mic, and commits leftover words.
  */
-const HISTORY_MAX = 2
+
+const STILL_MS = 1100
 const NOTHING_HEARD = '들린 말이 없어요.'
 
 type Page = 'home' | 'privacy'
 
-interface HistoryItem {
+interface Line {
   id: string
+  source: string
+  sourceLang: string
+  targetLang: string
   translation: string
+  error: string | null
+  pending: boolean
 }
 
 function hasWords(text: string): boolean {
   return /[\p{L}\p{N}]/u.test(text)
+}
+
+function tidy(text: string): string {
+  return text.replace(/\s+/g, ' ').trim()
+}
+
+function stripLead(text: string): string {
+  return text.replace(/^[\s.,!?。．！？、，…·:;"'“”‘’()[\]（）\-–—]+/u, '').trim()
+}
+
+/**
+ * Words after the last committed transcript snapshot.
+ * Speech grows by appending; a rewrite that is not a prefix is not re-sent.
+ */
+function uncommitted(full: string, base: string): string {
+  const f = tidy(full)
+  const b = tidy(base)
+  if (!f || f === b) return ''
+  if (!b) return stripLead(f)
+  if (f.startsWith(b)) return stripLead(f.slice(b.length))
+  // Chrome often capitalizes or adds punctuation after a pause.
+  if (f.toLowerCase().startsWith(b.toLowerCase())) return stripLead(f.slice(b.length))
+  let i = 0
+  const fl = f.toLowerCase()
+  const bl = b.toLowerCase()
+  const n = Math.min(fl.length, bl.length)
+  while (i < n && fl[i] === bl[i]) i++
+  if (i >= Math.floor(b.length * 0.7) && f.length > i) return stripLead(f.slice(i))
+  return ''
+}
+
+function shortError(message: string): string {
+  if (message.includes('한도') || message.includes('너무 많')) return '번역 한도'
+  if (message.includes('비어')) return '번역 없음'
+  return '번역 실패'
 }
 
 function OrbMark({ live }: { live: boolean }) {
@@ -39,12 +80,10 @@ export default function App() {
   const [listenLang, setListenLang] = useState(DEFAULT_LISTEN)
   const [targetLang, setTargetLang] = useState(DEFAULT_TARGET)
   const [recording, setRecording] = useState(false)
-  const [translating, setTranslating] = useState(false)
-  const [heard, setHeard] = useState('')
-  const [translation, setTranslation] = useState('')
+  const [lines, setLines] = useState<Line[]>([])
+  const [draft, setDraft] = useState('')
   const [notice, setNotice] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const [history, setHistory] = useState<HistoryItem[]>([])
 
   const supported = isSpeechRecognitionSupported()
 
@@ -52,77 +91,93 @@ export default function App() {
   const wantListenRef = useRef(false)
   /** Bumped on every start and stop. Late results from an older generation cannot update or restart the mic. */
   const generationRef = useRef(0)
-  /** Bumped when a new take starts so a late translation cannot overwrite it. */
-  const takeIdRef = useRef(0)
   const listenLangRef = useRef(listenLang)
   const targetLangRef = useRef(targetLang)
-  const translationRef = useRef('')
   const transcriptRef = useRef('')
+  /** Transcript snapshot already turned into lines. */
+  const baseRef = useRef('')
+  const linesRef = useRef<Line[]>([])
+  const pauseTimerRef = useRef<number | null>(null)
   const seqRef = useRef(0)
   const aliveRef = useRef(true)
   const stopRef = useRef<() => void>(() => {})
+  const sheetRef = useRef<HTMLDivElement>(null)
 
-  function rememberPrevious(text: string) {
-    const trimmed = text.trim()
-    if (!trimmed) return
-    const id = `${Date.now()}-${++seqRef.current}`
-    setHistory((prev) => {
-      if (prev[0]?.translation === trimmed) return prev
-      return [{ id, translation: trimmed }, ...prev].slice(0, HISTORY_MAX)
-    })
+  function clearPause() {
+    if (pauseTimerRef.current !== null) {
+      window.clearTimeout(pauseTimerRef.current)
+      pauseTimerRef.current = null
+    }
   }
 
-  async function finishTake(raw: string, takeId: number) {
-    if (!aliveRef.current || takeId !== takeIdRef.current) return
-    const text = raw.trim()
+  function commitPhrase(fullSnapshot: string, emptyNotice = false) {
+    const snapshot = tidy(fullSnapshot)
+    const text = uncommitted(snapshot, baseRef.current)
+    baseRef.current = snapshot
+    setDraft('')
     if (!hasWords(text)) {
-      setTranslating(false)
-      setError(null)
-      translationRef.current = ''
-      setTranslation('')
-      transcriptRef.current = ''
-      setHeard('')
-      setNotice(NOTHING_HEARD)
+      if (emptyNotice && linesRef.current.length === 0) setNotice(NOTHING_HEARD)
+      else if (linesRef.current.length > 0) setNotice(null)
       return
     }
 
-    setNotice(null)
-    setError(null)
-    setTranslating(true)
-    transcriptRef.current = text
-    setHeard(text)
-
+    const id = String(++seqRef.current)
     const from = listenLangRef.current
     const to = targetLangRef.current
-    const result = await translate(text, from, to)
-    if (!aliveRef.current || takeId !== takeIdRef.current) return
-    setTranslating(false)
-    if (!result.ok) {
-      setError(result.message)
-      setHeard(text)
-      translationRef.current = ''
-      setTranslation('')
-      return
+    const line: Line = {
+      id,
+      source: text,
+      sourceLang: from,
+      targetLang: to,
+      translation: '',
+      error: null,
+      pending: true,
     }
-    setError(null)
-    transcriptRef.current = ''
-    setHeard('')
-    translationRef.current = result.text
-    setTranslation(result.text)
+    linesRef.current = [...linesRef.current, line]
+    setLines(linesRef.current)
+    setNotice(null)
+    void translateLine(id, text, from, to)
+  }
+
+  function armStill(generation: number) {
+    clearPause()
+    const snapshot = transcriptRef.current
+    pauseTimerRef.current = window.setTimeout(() => {
+      pauseTimerRef.current = null
+      if (!aliveRef.current) return
+      if (generationRef.current !== generation || !wantListenRef.current) return
+      if (transcriptRef.current !== snapshot) return
+      commitPhrase(snapshot)
+    }, STILL_MS)
+  }
+
+  async function translateLine(id: string, text: string, from: string, to: string) {
+    const result = await translate(text, from, to)
+    if (!aliveRef.current) return
+    if (!linesRef.current.some((line) => line.id === id)) return
+    linesRef.current = linesRef.current.map((line) => {
+      if (line.id !== id) return line
+      if (!result.ok) {
+        return { ...line, pending: false, translation: '', error: shortError(result.message) }
+      }
+      return { ...line, pending: false, error: null, translation: result.text }
+    })
+    setLines(linesRef.current)
   }
 
   function stopListening() {
     if (!wantListenRef.current && recognitionRef.current === null) return
     const rec = recognitionRef.current
-    const text = (rec?.transcript() || transcriptRef.current).trim()
-    const takeId = takeIdRef.current
+    const text = tidy(rec?.transcript() || transcriptRef.current)
+    clearPause()
     // Generation first: a result already queued, or onend's restart, no longer matches.
     generationRef.current += 1
     wantListenRef.current = false
     recognitionRef.current = null
     setRecording(false)
     rec?.halt()
-    void finishTake(text, takeId)
+    transcriptRef.current = text
+    commitPhrase(text, true)
   }
 
   function startListening(): boolean {
@@ -131,14 +186,20 @@ export default function App() {
     const prev = recognitionRef.current
     recognitionRef.current = null
     if (prev) {
+      const leftover = tidy(prev.transcript() || transcriptRef.current)
+      clearPause()
       generationRef.current += 1
       wantListenRef.current = false
       prev.halt()
+      transcriptRef.current = leftover
+      if (hasWords(uncommitted(leftover, baseRef.current))) commitPhrase(leftover)
     }
 
+    clearPause()
     const generation = ++generationRef.current
     wantListenRef.current = true
     transcriptRef.current = ''
+    baseRef.current = ''
 
     const controller = createRecognition(
       listenLangRef.current,
@@ -156,20 +217,40 @@ export default function App() {
         onTranscript: (transcript) => {
           if (!aliveRef.current) return
           if (generationRef.current !== generation || !wantListenRef.current) return
+          if (transcript === transcriptRef.current) return
           transcriptRef.current = transcript
-          setHeard(transcript)
+          const phrase = uncommitted(transcript, baseRef.current)
+          // Do not translate interim words. A still phrase commits once.
+          if (!hasWords(phrase)) {
+            const t = tidy(transcript)
+            const b = tidy(baseRef.current)
+            if (b && t.toLowerCase().startsWith(b.toLowerCase())) baseRef.current = t
+            setDraft('')
+            clearPause()
+            return
+          }
+          setDraft(phrase)
+          armStill(generation)
         },
         onError: (message) => {
           if (!aliveRef.current) return
           if (generationRef.current !== generation) return
           setError(message)
           if (message.includes('권한이 거부')) {
+            const heard = tidy(transcriptRef.current)
+            clearPause()
             wantListenRef.current = false
             generationRef.current += 1
             setRecording(false)
             const current = recognitionRef.current
             recognitionRef.current = null
             current?.halt()
+            transcriptRef.current = heard
+            if (hasWords(uncommitted(heard, baseRef.current))) commitPhrase(heard)
+            else {
+              baseRef.current = heard
+              setDraft('')
+            }
           }
         },
       },
@@ -184,6 +265,9 @@ export default function App() {
       return false
     }
 
+    setNotice(null)
+    setError(null)
+    setDraft('')
     recognitionRef.current = controller
     try {
       // Must stay inside the tap handler so the browser allows the mic.
@@ -198,16 +282,7 @@ export default function App() {
       return false
     }
 
-    takeIdRef.current += 1
-    const prevKo = translationRef.current.trim()
-    if (prevKo) rememberPrevious(prevKo)
-    translationRef.current = ''
-    setTranslation('')
-    setNotice(null)
-    setError(null)
-    setTranslating(false)
     setRecording(true)
-    setHeard(transcriptRef.current)
     return true
   }
 
@@ -218,6 +293,16 @@ export default function App() {
     }
     if (!isSpeechRecognitionSupported()) return
     startListening()
+  }
+
+  function clearLines() {
+    clearPause()
+    baseRef.current = tidy(transcriptRef.current)
+    linesRef.current = []
+    setLines([])
+    setDraft('')
+    setNotice(null)
+    setError(null)
   }
 
   useEffect(() => {
@@ -240,11 +325,21 @@ export default function App() {
       aliveRef.current = false
       wantListenRef.current = false
       generationRef.current += 1
+      if (pauseTimerRef.current !== null) {
+        window.clearTimeout(pauseTimerRef.current)
+        pauseTimerRef.current = null
+      }
       const rec = recognitionRef.current
       recognitionRef.current = null
       rec?.halt()
     }
   }, [])
+
+  useLayoutEffect(() => {
+    const el = sheetRef.current
+    if (!el) return
+    el.scrollTop = el.scrollHeight
+  }, [lines, draft, error, notice, recording, page])
 
   const swapLanguages = () => {
     if (wantListenRef.current) return
@@ -257,49 +352,15 @@ export default function App() {
     setPage('privacy')
   }
 
-  const clearHistory = () => {
-    setHistory([])
-  }
-
   if (page === 'privacy') {
     return <Privacy onBack={() => setPage('home')} />
   }
 
-  let big = ''
-  let bigLang = 'ko'
-  let quiet = true
-  if (recording) {
-    if (heard) {
-      big = heard
-      bigLang = listenLang
-      quiet = false
-    } else {
-      big = '녹음 중'
-    }
-  } else if (translating) {
-    if (heard) {
-      big = heard
-      bigLang = listenLang
-      quiet = false
-    } else {
-      big = '번역 중'
-    }
-  } else if (translation) {
-    big = translation
-    bigLang = targetLang
-    quiet = false
-  } else if (heard) {
-    big = heard
-    bigLang = listenLang
-    quiet = false
-  } else if (notice) {
-    big = notice
-  } else if (!supported) {
-    big = 'Chrome에서만 들을 수 있어요'
-  } else if (!error) {
-    big = '녹음한 뒤 한 번만 번역해요'
-  }
-
+  const canClear = lines.length > 0 || hasWords(draft) || Boolean(notice)
+  const showIdle = lines.length === 0 && !recording && !error && !hasWords(draft)
+  const idleHint = !supported
+    ? 'Chrome에서만 들을 수 있어요'
+    : (notice ?? '녹음하면 문장마다 번역해요')
   const buttonLabel = recording ? '중지' : '녹음'
 
   return (
@@ -354,25 +415,44 @@ export default function App() {
         </button>
       </header>
 
-      <main className="stage">
-        <div className="stage-inner">
-          {big && (
-            <>
-              {!quiet && !recording && translation && (
-                <p className="kicker">번역</p>
-              )}
-              {recording && heard && <p className="kicker">듣는 중</p>}
-              <p
-                className={quiet ? 'result result-wait' : 'result'}
-                aria-live={recording ? 'off' : 'polite'}
-                lang={bigLang}
-              >
-                {big}
-              </p>
-            </>
-          )}
+      {canClear && (
+        <div className="clear-row">
+          <button type="button" className="text-btn clear-btn" onClick={clearLines}>
+            지우기
+          </button>
+        </div>
+      )}
 
-          {translating && heard && <p className="stage-note">번역 중</p>}
+      <div className="sheet" ref={sheetRef} role="main" aria-label="번역">
+        <div className="sheet-inner">
+          {showIdle && <p className="hint">{idleHint}</p>}
+
+          <div className="lines">
+            {lines.map((line) => (
+              <article key={line.id} className="line">
+                <p className="src" lang={line.sourceLang}>
+                  {line.source}
+                </p>
+                {line.pending && <p className="pending">번역 중</p>}
+                {!line.pending && line.translation && (
+                  <p className="tr" lang={line.targetLang}>
+                    {line.translation}
+                  </p>
+                )}
+                {line.error && (
+                  <p className="line-err" role="alert">
+                    {line.error}
+                  </p>
+                )}
+              </article>
+            ))}
+          </div>
+
+          {recording && (
+            <p className={draft ? 'draft' : 'draft is-wait'} lang={listenLang} aria-live="off">
+              {draft || '듣는 중'}
+            </p>
+          )}
 
           {error && (
             <p className="err" role="alert">
@@ -380,27 +460,12 @@ export default function App() {
             </p>
           )}
         </div>
-      </main>
-
-      {!recording && history.length > 0 && (
-        <section className="recent" aria-label="최근 번역">
-          <ul>
-            {history.map((item) => (
-              <li key={item.id}>{item.translation}</li>
-            ))}
-          </ul>
-          <button type="button" className="text-btn" onClick={clearHistory}>
-            지우기
-          </button>
-        </section>
-      )}
+      </div>
 
       <div className="dock">
-        {recording && (
-          <p id="rec-state" className="rec-state">
-            녹음 중 · 중지하면 번역돼요
-          </p>
-        )}
+        <p id="rec-state" className="rec-state" aria-hidden={recording ? undefined : true}>
+          {recording ? '말이 끊기면 번역' : '\u00a0'}
+        </p>
         <button
           type="button"
           className="orb-hit"
