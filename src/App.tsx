@@ -5,7 +5,8 @@ import { translate } from './lib/translate'
 import { Privacy } from './pages/Privacy'
 
 /**
- * One record control. While the mic is on, only the heard words are shown.
+ * One record control. While the mic is on, only the heard words are shown,
+ * and that line keeps every word heard in this take.
  * Translation runs once, for the whole take, when recording stops.
  * Stop bumps the generation and halt() aborts the mic so a late result cannot restart it.
  */
@@ -14,7 +15,7 @@ const NOTHING_HEARD = '들린 말이 없어요.'
 
 type Page = 'home' | 'privacy'
 
-interface Line {
+interface Take {
   id: string
   source: string
   sourceLang: string
@@ -32,29 +33,17 @@ function tidy(text: string): string {
   return text.replace(/\s+/g, ' ').trim()
 }
 
-function stripLead(text: string): string {
-  return text.replace(/^[\s.,!?。．！？、，…·:;"'“”‘’()[\]（）\-–—]+/u, '').trim()
-}
-
-/**
- * Words after the last committed transcript snapshot.
- * Speech grows by appending; a rewrite that is not a prefix is not re-sent.
- */
-function uncommitted(full: string, base: string): string {
-  const f = tidy(full)
-  const b = tidy(base)
-  if (!f || f === b) return ''
-  if (!b) return stripLead(f)
-  if (f.startsWith(b)) return stripLead(f.slice(b.length))
-  // Chrome often capitalizes or adds punctuation after a pause.
-  if (f.toLowerCase().startsWith(b.toLowerCase())) return stripLead(f.slice(b.length))
-  let i = 0
-  const fl = f.toLowerCase()
-  const bl = b.toLowerCase()
-  const n = Math.min(fl.length, bl.length)
-  while (i < n && fl[i] === bl[i]) i++
-  if (i >= Math.floor(b.length * 0.7) && f.length > i) return stripLead(f.slice(i))
-  return ''
+/** Keep the longer heard string so a short rewrite cannot throw the take away. */
+function bestHeard(a: string, b: string): string {
+  const x = tidy(a)
+  const y = tidy(b)
+  if (!hasWords(x)) return y
+  if (!hasWords(y)) return x
+  const xl = x.toLowerCase()
+  const yl = y.toLowerCase()
+  if (xl.includes(yl)) return x
+  if (yl.includes(xl)) return y
+  return x.length >= y.length ? x : y
 }
 
 function shortError(message: string): string {
@@ -78,8 +67,10 @@ export default function App() {
   const [listenLang, setListenLang] = useState(DEFAULT_LISTEN)
   const [targetLang, setTargetLang] = useState(DEFAULT_TARGET)
   const [recording, setRecording] = useState(false)
-  const [lines, setLines] = useState<Line[]>([])
-  const [draft, setDraft] = useState('')
+  const [current, setCurrent] = useState<Take | null>(null)
+  const [history, setHistory] = useState<Take[]>([])
+  const [historyOpen, setHistoryOpen] = useState(false)
+  const [live, setLive] = useState('')
   const [notice, setNotice] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
 
@@ -92,37 +83,67 @@ export default function App() {
   const listenLangRef = useRef(listenLang)
   const targetLangRef = useRef(targetLang)
   const transcriptRef = useRef('')
-  /** Transcript snapshot already turned into lines. */
-  const baseRef = useRef('')
-  const linesRef = useRef<Line[]>([])
-  const pauseTimerRef = useRef<number | null>(null)
+  const currentRef = useRef<Take | null>(null)
+  const historyRef = useRef<Take[]>([])
   const seqRef = useRef(0)
   const aliveRef = useRef(true)
   const stopRef = useRef<() => void>(() => {})
-  const sheetRef = useRef<HTMLDivElement>(null)
+  const boxRef = useRef<HTMLDivElement>(null)
 
-  function clearPause() {
-    if (pauseTimerRef.current !== null) {
-      window.clearTimeout(pauseTimerRef.current)
-      pauseTimerRef.current = null
-    }
+  function publishTakes() {
+    setCurrent(currentRef.current)
+    setHistory(historyRef.current)
   }
 
-  function commitPhrase(fullSnapshot: string, emptyNotice = false) {
-    const snapshot = tidy(fullSnapshot)
-    const text = uncommitted(snapshot, baseRef.current)
-    baseRef.current = snapshot
-    setDraft('')
+  function archiveCurrent() {
+    const prev = currentRef.current
+    if (!prev || !hasWords(prev.source)) return
+    historyRef.current = [prev, ...historyRef.current]
+    currentRef.current = null
+  }
+
+  function patchTake(id: string, patch: (take: Take) => Take) {
+    let found = false
+    if (currentRef.current?.id === id) {
+      currentRef.current = patch(currentRef.current)
+      found = true
+    }
+    const nextHistory = historyRef.current.map((take) => {
+      if (take.id !== id) return take
+      found = true
+      return patch(take)
+    })
+    if (!found) return
+    historyRef.current = nextHistory
+    publishTakes()
+  }
+
+  async function translateTake(id: string, text: string, from: string, to: string) {
+    const result = await translate(text, from, to)
+    if (!aliveRef.current) return
+    patchTake(id, (take) => {
+      if (!result.ok) {
+        return { ...take, pending: false, translation: '', error: shortError(result.message) }
+      }
+      return { ...take, pending: false, error: null, translation: result.text }
+    })
+  }
+
+  /** Save the whole take and translate it once. Never called while the mic is still the active take. */
+  function finishTake(raw: string) {
+    const text = tidy(raw)
+    transcriptRef.current = text
+    setLive('')
     if (!hasWords(text)) {
-      if (emptyNotice && linesRef.current.length === 0) setNotice(NOTHING_HEARD)
-      else if (linesRef.current.length > 0) setNotice(null)
+      setNotice(NOTHING_HEARD)
+      publishTakes()
       return
     }
-
+    archiveCurrent()
     const id = String(++seqRef.current)
     const from = listenLangRef.current
     const to = targetLangRef.current
-    const line: Line = {
+    const take: Take = {
       id,
       source: text,
       sourceLang: from,
@@ -131,39 +152,29 @@ export default function App() {
       error: null,
       pending: true,
     }
-    linesRef.current = [...linesRef.current, line]
-    setLines(linesRef.current)
+    currentRef.current = take
     setNotice(null)
-    void translateLine(id, text, from, to)
+    publishTakes()
+    void translateTake(id, text, from, to)
   }
 
-  async function translateLine(id: string, text: string, from: string, to: string) {
-    const result = await translate(text, from, to)
-    if (!aliveRef.current) return
-    if (!linesRef.current.some((line) => line.id === id)) return
-    linesRef.current = linesRef.current.map((line) => {
-      if (line.id !== id) return line
-      if (!result.ok) {
-        return { ...line, pending: false, translation: '', error: shortError(result.message) }
-      }
-      return { ...line, pending: false, error: null, translation: result.text }
-    })
-    setLines(linesRef.current)
+  function heardNow(rec: { transcript: () => string } | null, before = ''): string {
+    return tidy(bestHeard(rec?.transcript() ?? '', bestHeard(before, transcriptRef.current)))
   }
 
   function stopListening() {
     if (!wantListenRef.current && recognitionRef.current === null) return
     const rec = recognitionRef.current
-    const text = tidy(rec?.transcript() || transcriptRef.current)
-    clearPause()
+    const before = rec?.transcript() ?? transcriptRef.current
     // Generation first: a result already queued, or onend's restart, no longer matches.
     generationRef.current += 1
     wantListenRef.current = false
     recognitionRef.current = null
     setRecording(false)
     rec?.halt()
+    const text = heardNow(rec, before)
     transcriptRef.current = text
-    commitPhrase(text, true)
+    finishTake(text)
   }
 
   function startListening(): boolean {
@@ -172,20 +183,20 @@ export default function App() {
     const prev = recognitionRef.current
     recognitionRef.current = null
     if (prev) {
-      const leftover = tidy(prev.transcript() || transcriptRef.current)
-      clearPause()
+      const before = prev.transcript() || transcriptRef.current
       generationRef.current += 1
       wantListenRef.current = false
       prev.halt()
-      transcriptRef.current = leftover
-      if (hasWords(uncommitted(leftover, baseRef.current))) commitPhrase(leftover)
+      const leftover = heardNow(prev, before)
+      if (hasWords(leftover)) finishTake(leftover)
     }
 
-    clearPause()
     const generation = ++generationRef.current
     wantListenRef.current = true
     transcriptRef.current = ''
-    baseRef.current = ''
+    setLive('')
+    setNotice(null)
+    setError(null)
 
     const controller = createRecognition(
       listenLangRef.current,
@@ -203,39 +214,28 @@ export default function App() {
         onTranscript: (transcript) => {
           if (!aliveRef.current) return
           if (generationRef.current !== generation || !wantListenRef.current) return
-          if (transcript === transcriptRef.current) return
-          transcriptRef.current = transcript
-          const phrase = uncommitted(transcript, baseRef.current)
+          const text = tidy(transcript)
+          if (!text || text === transcriptRef.current) return
+          transcriptRef.current = text
           // Heard words only. Translation waits for stop.
-          if (!hasWords(phrase)) {
-            const t = tidy(transcript)
-            const b = tidy(baseRef.current)
-            if (b && t.toLowerCase().startsWith(b.toLowerCase())) baseRef.current = t
-            setDraft('')
-            clearPause()
-            return
-          }
-          setDraft(phrase)
+          setLive(text)
         },
         onError: (message) => {
           if (!aliveRef.current) return
           if (generationRef.current !== generation) return
           setError(message)
           if (message.includes('권한이 거부')) {
-            const heard = tidy(transcriptRef.current)
-            clearPause()
+            const currentRec = recognitionRef.current
+            const before = currentRec?.transcript() ?? transcriptRef.current
             wantListenRef.current = false
             generationRef.current += 1
-            setRecording(false)
-            const current = recognitionRef.current
             recognitionRef.current = null
-            current?.halt()
-            transcriptRef.current = heard
-            if (hasWords(uncommitted(heard, baseRef.current))) commitPhrase(heard)
-            else {
-              baseRef.current = heard
-              setDraft('')
-            }
+            setRecording(false)
+            currentRec?.halt()
+            const text = heardNow(currentRec, before)
+            transcriptRef.current = text
+            if (hasWords(text)) finishTake(text)
+            else setLive('')
           }
         },
       },
@@ -250,9 +250,6 @@ export default function App() {
       return false
     }
 
-    setNotice(null)
-    setError(null)
-    setDraft('')
     recognitionRef.current = controller
     try {
       // Must stay inside the tap handler so the browser allows the mic.
@@ -267,6 +264,9 @@ export default function App() {
       return false
     }
 
+    // Mic is on. This box is the new live line; the previous result moves to history.
+    archiveCurrent()
+    publishTakes()
     setRecording(true)
     return true
   }
@@ -281,13 +281,21 @@ export default function App() {
   }
 
   function clearLines() {
-    clearPause()
-    baseRef.current = tidy(transcriptRef.current)
-    linesRef.current = []
-    setLines([])
-    setDraft('')
+    historyRef.current = []
+    currentRef.current = null
+    setHistory([])
+    setCurrent(null)
     setNotice(null)
     setError(null)
+    if (wantListenRef.current && recognitionRef.current) {
+      recognitionRef.current.forget()
+      const shown = tidy(recognitionRef.current.transcript())
+      transcriptRef.current = shown
+      setLive(shown)
+      return
+    }
+    transcriptRef.current = ''
+    setLive('')
   }
 
   useEffect(() => {
@@ -310,10 +318,6 @@ export default function App() {
       aliveRef.current = false
       wantListenRef.current = false
       generationRef.current += 1
-      if (pauseTimerRef.current !== null) {
-        window.clearTimeout(pauseTimerRef.current)
-        pauseTimerRef.current = null
-      }
       const rec = recognitionRef.current
       recognitionRef.current = null
       rec?.halt()
@@ -321,10 +325,15 @@ export default function App() {
   }, [])
 
   useLayoutEffect(() => {
-    const el = sheetRef.current
+    const el = boxRef.current
     if (!el) return
-    el.scrollTop = el.scrollHeight
-  }, [lines, draft, error, notice, recording, page])
+    if (!recording) {
+      el.scrollTop = 0
+      return
+    }
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 96
+    if (nearBottom) el.scrollTop = el.scrollHeight
+  }, [live, recording, current])
 
   const swapLanguages = () => {
     if (wantListenRef.current) return
@@ -341,13 +350,9 @@ export default function App() {
     return <Privacy onBack={() => setPage('home')} />
   }
 
-  const canClear = lines.length > 0 || hasWords(draft) || Boolean(notice)
-  const showIdle = lines.length === 0 && !recording && !error && !hasWords(draft)
-  const idleHint = !supported
-    ? 'Chrome에서만 들을 수 있어요'
-    : (notice ?? '녹음하고 멈추면 번역해요')
+  const canClear = history.length > 0 || current !== null || hasWords(live) || Boolean(notice) || Boolean(error)
   const buttonLabel = recording ? '중지' : '녹음'
-  const last = lines.length > 0 ? lines[lines.length - 1] : undefined
+  const idleHint = !supported ? 'Chrome에서만 들을 수 있어요' : (notice ?? '녹음하고 멈추면 번역해요')
 
   return (
     <div className="screen">
@@ -409,41 +414,73 @@ export default function App() {
         </div>
       )}
 
-      <div className="sheet" ref={sheetRef} role="main" aria-label="번역">
-        <div className="sheet-inner">
-          {showIdle && <p className="hint">{idleHint}</p>}
+      <div className="result-box" ref={boxRef} role="region" aria-label="번역">
+        {!recording && !current && <p className="hint">{idleHint}</p>}
 
-          {recording && (
-            <p className={draft ? 'tr live-heard' : 'draft is-wait'} lang={listenLang} aria-live="off">
-              {draft || '듣는 중'}
+        {recording && (
+          <p className={hasWords(live) ? 'src' : 'src is-wait'} lang={listenLang} aria-live="off">
+            {hasWords(live) ? live : '듣는 중'}
+          </p>
+        )}
+
+        {!recording && current && (
+          <div className="take">
+            <p className="src" lang={current.sourceLang}>
+              {current.source}
             </p>
-          )}
-
-          {!recording && last && (
-            <article className="hero-block">
-              {last.pending && <p className="pending">번역 중</p>}
-              {!last.pending && last.translation && (
-                <p className="tr" lang={last.targetLang}>
-                  {last.translation}
-                </p>
-              )}
-              {last.error && (
-                <p className="line-err" role="alert">
-                  {last.error}
-                </p>
-              )}
-              <p className="src" lang={last.sourceLang}>
-                {last.source}
+            {current.pending ? <p className="pending">번역 중</p> : null}
+            {!current.pending && current.translation ? (
+              <p className="tr" lang={current.targetLang}>
+                {current.translation}
               </p>
-            </article>
-          )}
+            ) : null}
+            {current.error ? (
+              <p className="line-err" role="alert">
+                {current.error}
+              </p>
+            ) : null}
+          </div>
+        )}
 
-          {error && (
-            <p className="err" role="alert">
-              {error}
-            </p>
-          )}
-        </div>
+        {error && (
+          <p className="err" role="alert">
+            {error}
+          </p>
+        )}
+      </div>
+
+      <div className="history">
+        {historyOpen && (
+          <div id="history-panel" className="history-panel" role="region" aria-label="히스토리">
+            {history.length === 0 ? (
+              <p className="history-empty">아직 없어요.</p>
+            ) : (
+              history.map((item) => (
+                <article key={item.id} className="hist-item">
+                  <p className="hist-en" lang={item.sourceLang}>
+                    {item.source}
+                  </p>
+                  {item.pending ? <p className="hist-ko is-wait">번역 중</p> : null}
+                  {!item.pending && item.translation ? (
+                    <p className="hist-ko" lang={item.targetLang}>
+                      {item.translation}
+                    </p>
+                  ) : null}
+                  {item.error ? <p className="hist-err">{item.error}</p> : null}
+                </article>
+              ))
+            )}
+          </div>
+        )}
+        <button
+          type="button"
+          className="history-btn"
+          aria-expanded={historyOpen}
+          aria-controls="history-panel"
+          onClick={() => setHistoryOpen((open) => !open)}
+        >
+          히스토리
+        </button>
       </div>
 
       <div className="dock">

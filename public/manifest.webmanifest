@@ -1,7 +1,7 @@
 {
   "name": "여행 통역",
   "short_name": "여행 통역",
-  "description": "말하면 문장마다 번역하는 여행 통역",
+  "description": "녹음하고 멈추면 번역하는 여행 통역",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#f6f3ee",
