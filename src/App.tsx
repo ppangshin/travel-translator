@@ -1,55 +1,32 @@
 import { useEffect, useRef, useState } from 'react'
 import { DEFAULT_LISTEN, DEFAULT_TARGET, LANGUAGES } from './lib/languages'
-import { createRecognition, isSpeechRecognitionSupported } from './lib/speech'
+import { createRecognition, isSpeechRecognitionSupported, phraseText } from './lib/speech'
+import type { RecognitionController, SpeechPart } from './lib/speech'
 import { translate } from './lib/translate'
 import { Privacy } from './pages/Privacy'
 
 /**
- * Translate only after the heard line has been unchanged for this long.
+ * A phrase ends when the heard line has been still for this long, or on mute.
  * Not on every interim tick, and not by restarting recognition.
  */
 const PAUSE_MS = 600
-const HISTORY_MAX = 3
+const HISTORY_MAX = 2
 
 type Page = 'home' | 'privacy'
-type HeroMode = 'idle' | 'heard' | 'ko'
 
 interface HistoryItem {
   id: string
-  source: string
   translation: string
-}
-
-function heroClass(text: string): string {
-  const n = Array.from(text).length
-  if (n > 70) return 'hero hero-xs'
-  if (n > 26) return 'hero hero-sm'
-  return 'hero'
-}
-
-/**
- * Portion of the session said after the last pause-translation.
- * A missing word boundary means the engine revised the word ("to" → "today"),
- * so the whole session is the current line again.
- */
-function tailAfter(session: string, committed: string): string {
-  if (!committed) return session
-  if (session === committed) return ''
-  if (session.startsWith(committed)) {
-    const rest = session.slice(committed.length)
-    if (/^\s/.test(rest)) return rest.trim()
-  }
-  return session
 }
 
 function OrbMark({ live, muted }: { live: boolean; muted?: boolean }) {
   const className = live ? 'orb is-live' : muted ? 'orb is-muted' : 'orb'
   return (
-    <div className={className} aria-hidden="true">
+    <span className={className} aria-hidden="true">
       <span className="ring r1" />
       <span className="ring r2" />
       <span className="ring r3" />
-    </div>
+    </span>
   )
 }
 
@@ -62,31 +39,40 @@ export default function App() {
   const [heard, setHeard] = useState('')
   const [settledSource, setSettledSource] = useState('')
   const [translation, setTranslation] = useState('')
-  const [heroMode, setHeroMode] = useState<HeroMode>('idle')
   const [error, setError] = useState<string | null>(null)
   const [history, setHistory] = useState<HistoryItem[]>([])
 
   const supported = isSpeechRecognitionSupported()
 
-  const recognitionRef = useRef<SpeechRecognition | null>(null)
+  const recognitionRef = useRef<RecognitionController | null>(null)
   const wantListenRef = useRef(false)
+  /** Bumped on every start and stop. Results from an older epoch are dropped. */
+  const listenEpochRef = useRef(0)
   const listenLangRef = useRef(listenLang)
   const targetLangRef = useRef(targetLang)
   const heardRef = useRef('')
-  const sessionRef = useRef('')
-  const committedSessionRef = useRef('')
   const settledSourceRef = useRef('')
   const settledTranslationRef = useRef('')
   // Bumped when the heard line changes so a slower earlier translate() cannot paint over a newer line.
   const requestGenRef = useRef(0)
-  const inflightRef = useRef('')
-  const inflightGenRef = useRef(0)
   const pendingLineRef = useRef('')
+  /**
+   * Phrases committed on a pause/mute, translated in order.
+   * A later result can return first; it waits so the screen does not skip a phrase.
+   */
+  const slotsRef = useRef<Map<number, { source: string; status: 'pending' | 'ready' | 'skip'; text: string }>>(
+    new Map(),
+  )
+  const nextSlotRef = useRef(1)
+  const slotSeqRef = useRef(0)
   const pauseTimerRef = useRef<number | null>(null)
-  const lastSavedRef = useRef({ source: '', at: 0 })
+  const partsRef = useRef<SpeechPart[]>([])
+  /** Results before this index already belong to earlier phrases in this session. */
+  const consumedRef = useRef(0)
+  const sessionIdRef = useRef(0)
   const seqRef = useRef(0)
   const aliveRef = useRef(true)
-  const handleSessionRef = useRef<(session: string) => void>(() => {})
+  const handlePartsRef = useRef<(parts: SpeechPart[]) => void>(() => {})
   const stopRef = useRef<() => void>(() => {})
 
   useEffect(() => {
@@ -101,101 +87,111 @@ export default function App() {
     }
   }
 
-  function commitHistory(source: string, translated: string) {
-    const now = Date.now()
-    if (lastSavedRef.current.source === source && now - lastSavedRef.current.at < 1200) return
-    lastSavedRef.current = { source, at: now }
-    const id = `${now}-${++seqRef.current}`
-    setHistory((prev) => [{ id, source, translation: translated }, ...prev].slice(0, HISTORY_MAX))
+  function rememberPrevious(text: string) {
+    const trimmed = text.trim()
+    if (!trimmed) return
+    const id = `${Date.now()}-${++seqRef.current}`
+    setHistory((prev) => {
+      if (prev[0]?.translation === trimmed) return prev
+      return [{ id, translation: trimmed }, ...prev].slice(0, HISTORY_MAX)
+    })
   }
 
-  async function translatePaused(line: string, gen: number, sessionAt: string) {
+  /** Current Korean stays on the big line. The line it replaces moves to history. */
+  function adoptTranslation(source: string, text: string) {
+    const prevText = settledTranslationRef.current
+    if (prevText && prevText !== text) rememberPrevious(prevText)
+    settledSourceRef.current = source
+    settledTranslationRef.current = text
+    setSettledSource(source)
+    setTranslation(text)
+    setError(null)
+  }
+
+  function openSlot(source: string): number {
+    const id = ++slotSeqRef.current
+    slotsRef.current.set(id, { source, status: 'pending', text: '' })
+    return id
+  }
+
+  function flushSlots() {
+    let id = nextSlotRef.current
+    while (true) {
+      const slot = slotsRef.current.get(id)
+      if (!slot || slot.status === 'pending') return
+      slotsRef.current.delete(id)
+      nextSlotRef.current = id + 1
+      if (
+        slot.status === 'ready' &&
+        slot.text &&
+        !(slot.source === settledSourceRef.current && slot.text === settledTranslationRef.current)
+      ) {
+        adoptTranslation(slot.source, slot.text)
+      }
+      id = nextSlotRef.current
+    }
+  }
+
+  function finishSlot(id: number, status: 'ready' | 'skip', translated = '') {
+    const slot = slotsRef.current.get(id)
+    if (!slot || slot.status !== 'pending') return
+    slot.status = status
+    slot.text = translated
+    flushSlots()
+  }
+
+  async function translateSlot(text: string, slotId: number) {
+    const result = await translate(text, listenLangRef.current, targetLangRef.current)
+    if (!aliveRef.current) return
+    if (!result.ok) {
+      if (heardRef.current === text) setError(result.message)
+      finishSlot(slotId, 'skip')
+      return
+    }
+    finishSlot(slotId, 'ready', result.text)
+  }
+
+  /** Queue one finished phrase. Later phrases wait so a slow reply cannot skip this one. */
+  function commitLine(line: string, gen: number) {
     const text = line.trim()
     if (!text) return
     if (gen !== requestGenRef.current) return
-    if (text === settledSourceRef.current && settledTranslationRef.current) {
-      if (heardRef.current === text) setHeroMode('ko')
-      return
-    }
-    if (inflightRef.current === text && inflightGenRef.current === gen) return
-
-    inflightRef.current = text
-    inflightGenRef.current = gen
-
-    const result = await translate(text, listenLangRef.current, targetLangRef.current)
-    if (!aliveRef.current) return
-    if (inflightRef.current === text) inflightRef.current = ''
-
-    // Stale: the speaker already moved on, or a newer request owns the screen.
-    if (gen !== requestGenRef.current) return
-    if (heardRef.current !== text) return
-    if (!result.ok) {
-      setError(result.message)
-      return
-    }
-
-    if (sessionRef.current === sessionAt) committedSessionRef.current = sessionAt
-    settledSourceRef.current = text
-    settledTranslationRef.current = result.text
-    setSettledSource(text)
-    setTranslation(result.text)
-    setHeroMode('ko')
-    setError(null)
-    commitHistory(text, result.text)
+    if (text === settledSourceRef.current && settledTranslationRef.current) return
+    const slotId = openSlot(text)
+    void translateSlot(text, slotId)
   }
 
   function schedulePause(line: string) {
-    if (
-      line === settledSourceRef.current &&
-      settledTranslationRef.current &&
-      heardRef.current === line
-    ) {
-      setHeroMode('ko')
-      return
-    }
     if (pendingLineRef.current === line && pauseTimerRef.current !== null) return
 
     clearPause()
     pendingLineRef.current = line
     const gen = requestGenRef.current
-    const sessionAt = sessionRef.current
+    const boundary = partsRef.current.length
+    const sessionId = sessionIdRef.current
     pauseTimerRef.current = window.setTimeout(() => {
       pauseTimerRef.current = null
-      void translatePaused(line, gen, sessionAt)
+      // Only this session's cursor. A Chrome restart has a fresh result list.
+      if (sessionIdRef.current === sessionId && consumedRef.current < boundary) {
+        consumedRef.current = boundary
+      }
+      commitLine(line, gen)
     }, PAUSE_MS)
   }
 
   function presentLine(line: string) {
-    if (
-      line === heardRef.current &&
-      line === settledSourceRef.current &&
-      settledTranslationRef.current
-    ) {
-      setHeroMode('ko')
-      return
-    }
-
     if (line !== heardRef.current) {
       heardRef.current = line
       setHeard(line)
-      setHeroMode('heard')
       requestGenRef.current += 1
     }
     schedulePause(line)
   }
 
-  function handleSession(raw: string) {
+  function handleParts(parts: SpeechPart[]) {
     if (!wantListenRef.current) return
-    const session = raw.replace(/\s+/g, ' ').trim()
-    if (!session) return
-    sessionRef.current = session
-
-    const committed = committedSessionRef.current
-    if (committed && session !== committed && !session.startsWith(committed)) {
-      committedSessionRef.current = ''
-    }
-
-    const line = tailAfter(session, committedSessionRef.current)
+    partsRef.current = parts
+    const line = phraseText(parts, consumedRef.current)
     if (!line) return
     presentLine(line)
   }
@@ -203,29 +199,27 @@ export default function App() {
   function stopListening() {
     const line = heardRef.current.trim()
     const gen = requestGenRef.current
-    const sessionAt = sessionRef.current
+    const boundary = partsRef.current.length
+    const sessionId = sessionIdRef.current
     const needsTail =
       Boolean(line) && !(line === settledSourceRef.current && settledTranslationRef.current)
 
+    // Epoch first: a result already queued, or onend's restart, no longer matches.
+    listenEpochRef.current += 1
     wantListenRef.current = false
     setListening(false)
     clearPause()
 
     const rec = recognitionRef.current
     recognitionRef.current = null
-    if (rec) {
-      try {
-        rec.onend = null
-        rec.onresult = null
-        rec.onerror = null
-        rec.stop()
-      } catch {
-        /* ignore */
-      }
+    rec?.halt()
+
+    if (sessionIdRef.current === sessionId && consumedRef.current < boundary) {
+      consumedRef.current = boundary
     }
 
     // Mute is not how you ask for a translation; this only keeps a trailing phrase.
-    if (needsTail) void translatePaused(line, gen, sessionAt)
+    if (needsTail) commitLine(line, gen)
   }
 
   function startListening(): boolean {
@@ -233,65 +227,73 @@ export default function App() {
 
     const prev = recognitionRef.current
     recognitionRef.current = null
-    if (prev) {
-      try {
-        prev.onend = null
-        prev.onresult = null
-        prev.onerror = null
-        prev.stop()
-      } catch {
-        /* ignore */
-      }
-    }
+    prev?.halt()
 
+    const epoch = ++listenEpochRef.current
     wantListenRef.current = true
-    sessionRef.current = ''
-    committedSessionRef.current = ''
+    sessionIdRef.current += 1
+    consumedRef.current = 0
+    partsRef.current = []
     setError(null)
 
-    const recognition = createRecognition(
+    const controller = createRecognition(
       listenLangRef.current,
       {
         onStart: () => {
-          if (!wantListenRef.current) return
+          if (!aliveRef.current) return
+          if (listenEpochRef.current !== epoch || !wantListenRef.current) return
           setListening(true)
-          sessionRef.current = ''
-          committedSessionRef.current = ''
+          sessionIdRef.current += 1
+          consumedRef.current = 0
+          partsRef.current = []
         },
         onEnd: () => {
+          if (!aliveRef.current) return
+          if (listenEpochRef.current !== epoch) return
           if (!wantListenRef.current) setListening(false)
         },
-        onLine: (session) => {
-          handleSessionRef.current(session)
+        onParts: (parts) => {
+          if (!aliveRef.current) return
+          if (listenEpochRef.current !== epoch || !wantListenRef.current) return
+          handlePartsRef.current(parts)
         },
         onError: (message) => {
+          if (!aliveRef.current) return
+          if (listenEpochRef.current !== epoch) return
           setError(message)
           if (message.includes('권한이 거부')) {
             wantListenRef.current = false
+            listenEpochRef.current += 1
             setListening(false)
             setArmed(false)
+            const current = recognitionRef.current
+            recognitionRef.current = null
+            current?.halt()
           }
         },
       },
-      () => wantListenRef.current,
+      () => wantListenRef.current && listenEpochRef.current === epoch,
     )
 
-    if (!recognition) {
-      setError('음성 인식을 시작할 수 없어요.')
+    if (!controller) {
       wantListenRef.current = false
+      listenEpochRef.current += 1
       setListening(false)
+      setError('음성 인식을 시작할 수 없어요.')
       return false
     }
 
-    recognitionRef.current = recognition
+    recognitionRef.current = controller
     try {
       // Must stay inside the tap handler so the browser allows the mic.
-      recognition.start()
+      controller.start()
       setListening(true)
       return true
     } catch {
       recognitionRef.current = null
       wantListenRef.current = false
+      listenEpochRef.current += 1
+      controller.halt()
       setListening(false)
       setError('음성 인식을 시작할 수 없어요. 잠시 후 다시 시도해 주세요.')
       return false
@@ -299,18 +301,21 @@ export default function App() {
   }
 
   /**
-   * The one mic gesture. Browsers will not open the mic without it.
-   * After this, listening stays on until mute. The orb is not a record toggle.
+   * The mic gesture. Browsers will not open the mic without it.
+   * The same control stops listening — the orb is large enough to hit while traveling.
    */
-  function startFromGesture() {
+  function onMicGesture() {
+    if (wantListenRef.current) {
+      stopListening()
+      return
+    }
     if (!isSpeechRecognitionSupported()) return
-    if (wantListenRef.current) return
     const ok = startListening()
-    setArmed(ok)
+    if (ok) setArmed(true)
   }
 
   useEffect(() => {
-    handleSessionRef.current = handleSession
+    handlePartsRef.current = handleParts
     stopRef.current = stopListening
   })
 
@@ -329,21 +334,14 @@ export default function App() {
     return () => {
       aliveRef.current = false
       wantListenRef.current = false
+      listenEpochRef.current += 1
       if (pauseTimerRef.current !== null) {
         window.clearTimeout(pauseTimerRef.current)
         pauseTimerRef.current = null
       }
       const rec = recognitionRef.current
       recognitionRef.current = null
-      if (rec) {
-        try {
-          rec.onend = null
-          rec.onresult = null
-          rec.abort()
-        } catch {
-          /* ignore */
-        }
-      }
+      rec?.halt()
     }
   }, [])
 
@@ -359,7 +357,6 @@ export default function App() {
   }
 
   const clearHistory = () => {
-    lastSavedRef.current = { source: '', at: 0 }
     setHistory([])
   }
 
@@ -367,20 +364,10 @@ export default function App() {
     return <Privacy onBack={() => setPage('home')} />
   }
 
-  const showingHeard = heroMode === 'heard' && heard.length > 0
-  const showingKo = heroMode === 'ko' && translation.length > 0
-  const heroText = showingHeard
-    ? heard
-    : showingKo
-      ? translation
-      : listening
-        ? '듣는 중'
-        : '음소거됨'
-  const heroClassName = showingHeard
-    ? `${heroClass(heard)} is-pending`
-    : showingKo
-      ? heroClass(translation)
-      : 'hero-hint'
+  const hasTranslation = translation.length > 0
+  const sourceLive = heard.length > 0 && heard !== settledSource
+  const sourceText = sourceLive ? heard : settledSource
+  const headline = hasTranslation ? translation : listening ? '듣는 중' : '음소거됨'
 
   return (
     <div className="screen">
@@ -435,12 +422,7 @@ export default function App() {
       </header>
 
       {!armed ? (
-        <button
-          type="button"
-          className="arm"
-          onClick={startFromGesture}
-          disabled={!supported}
-        >
+        <button type="button" className="arm" onClick={onMicGesture} disabled={!supported}>
           <span className="arm-copy">
             <span className={supported ? 'arm-hint' : 'hero-hint'}>
               {supported ? '화면을 눌러 듣기' : 'Chrome에서만 들을 수 있어요'}
@@ -463,17 +445,17 @@ export default function App() {
           <main className="stage">
             <div className="stage-inner">
               <p
-                className={heroClassName}
+                className={hasTranslation ? 'result' : 'result result-wait'}
                 aria-live="polite"
-                lang={showingHeard ? listenLang : showingKo ? targetLang : 'ko'}
+                lang={hasTranslation ? targetLang : 'ko'}
               >
-                {heroText}
+                {headline}
               </p>
 
-              {showingKo && settledSource && (
-                <p className="heard" lang={listenLang}>
+              {sourceText && (
+                <p className="source-line" lang={listenLang}>
                   <span className="sr-only">들린 말 </span>
-                  {settledSource}
+                  {sourceText}
                 </p>
               )}
 
@@ -487,37 +469,30 @@ export default function App() {
 
           {history.length > 0 && (
             <section className="recent" aria-label="최근 번역">
-              <div className="recent-head">
-                <span className="recent-label">최근</span>
-                <button type="button" className="text-btn" onClick={clearHistory}>
-                  지우기
-                </button>
-              </div>
               <ul>
                 {history.map((item) => (
-                  <li key={item.id}>
-                    <p className="recent-tr">{item.translation}</p>
-                    <p className="recent-src">{item.source}</p>
-                  </li>
+                  <li key={item.id}>{item.translation}</li>
                 ))}
               </ul>
+              <button type="button" className="text-btn" onClick={clearHistory}>
+                지우기
+              </button>
             </section>
           )}
 
           <div className="dock">
-            <div className="orb-dock">
+            <button
+              type="button"
+              className="orb-hit"
+              onClick={onMicGesture}
+              aria-pressed={listening}
+              aria-label={listening ? '음소거' : '다시 듣기'}
+            >
               <OrbMark live={listening} muted={!listening} />
-              <p className="orb-caption" aria-hidden="true">
-                {listening ? '듣는 중' : '음소거됨'}
-              </p>
-              <button
-                type="button"
-                className="mute"
-                onClick={listening ? stopListening : startFromGesture}
-              >
-                {listening ? '음소거' : '다시 듣기'}
-              </button>
-            </div>
+              <span className="orb-caption" aria-hidden="true">
+                {listening ? '듣는 중' : '다시 듣기'}
+              </span>
+            </button>
           </div>
         </>
       )}

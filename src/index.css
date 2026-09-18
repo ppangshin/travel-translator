@@ -1,3 +1,4 @@
+/* Travel translator — warm paper, one calm reading size. */
 :root {
   color-scheme: light;
   --bg: #f6f3ee;
@@ -149,36 +150,26 @@ select:disabled {
 
 .stage-inner {
   margin-block: auto;
-  padding: 0.75rem 0.15rem 1rem;
+  padding: 1.35rem 0.15rem 1.75rem;
   text-align: center;
 }
 
-.hero {
+/* One size. Length wraps; it does not shrink into a new type size. */
+.result {
   margin: 0;
-  font-weight: 600;
-  font-size: clamp(2.2rem, 8.2vw, 3rem);
-  line-height: 1.28;
-  letter-spacing: -0.04em;
+  font-weight: 650;
+  font-size: 2rem;
+  line-height: 1.45;
+  letter-spacing: -0.03em;
   text-wrap: balance;
   word-break: keep-all;
   overflow-wrap: anywhere;
   color: var(--ink);
 }
 
-.hero-sm {
-  font-size: clamp(1.65rem, 6.2vw, 2.15rem);
-  letter-spacing: -0.03em;
-}
-
-.hero-xs {
-  font-size: clamp(1.2rem, 4.6vw, 1.45rem);
-  line-height: 1.4;
-  letter-spacing: -0.02em;
-  text-wrap: pretty;
-}
-
-.hero.is-pending {
+.result-wait {
   color: var(--muted);
+  font-weight: 550;
 }
 
 .hero-hint {
@@ -189,17 +180,20 @@ select:disabled {
   letter-spacing: -0.02em;
 }
 
-.heard {
-  margin: 0.9rem 0 0;
-  color: var(--muted);
-  font-size: 0.95rem;
-  line-height: 1.45;
+.source-line {
+  margin: 1.65rem auto 0;
+  max-width: 22rem;
+  color: #3a3834;
+  font-size: 1rem;
+  font-weight: 500;
+  line-height: 1.5;
+  letter-spacing: -0.01em;
   word-break: keep-all;
   overflow-wrap: anywhere;
 }
 
 .err {
-  margin: 0.7rem 0 0;
+  margin: 1rem 0 0;
   color: var(--danger);
   font-size: 0.84rem;
   line-height: 1.4;
@@ -207,60 +201,44 @@ select:disabled {
 
 .recent {
   flex: none;
-  padding: 0.15rem 0 0.35rem;
-}
-
-.recent-head {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  margin-bottom: 0.15rem;
-}
-
-.recent-label,
-.text-btn {
-  font-size: 0.72rem;
-  color: var(--faint);
-}
-
-.text-btn {
-  border: 0;
-  background: none;
-  padding: 0.25rem 0;
-  text-decoration: underline;
-  text-underline-offset: 2px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  column-gap: 0.85rem;
+  align-items: end;
+  padding: 0.2rem 0.05rem 0.15rem;
 }
 
 .recent ul {
   list-style: none;
   margin: 0;
   padding: 0;
+  min-width: 0;
+}
+
+.recent li {
+  margin: 0;
+  font-size: 0.78rem;
+  line-height: 1.35;
+  font-weight: 500;
+  letter-spacing: -0.02em;
+  color: #3a3834;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .recent li + li {
-  margin-top: 0.45rem;
+  margin-top: 0.12rem;
 }
 
-.recent-tr,
-.recent-src {
-  margin: 0;
-  overflow: hidden;
-  display: -webkit-box;
-  -webkit-box-orient: vertical;
-}
-
-.recent-tr {
-  font-size: 0.92rem;
-  font-weight: 550;
-  letter-spacing: -0.02em;
-  -webkit-line-clamp: 2;
-}
-
-.recent-src {
-  margin-top: 0.05rem;
-  font-size: 0.75rem;
+.text-btn {
+  border: 0;
+  background: none;
+  padding: 0.35rem 0.1rem;
+  font-size: 0.7rem;
   color: var(--faint);
-  -webkit-line-clamp: 1;
+  text-decoration: underline;
+  text-underline-offset: 2px;
 }
 
 .dock {
@@ -268,14 +246,19 @@ select:disabled {
   display: flex;
   flex-direction: column;
   align-items: center;
-  padding: 0.15rem 0 0.1rem;
+  padding: 0.35rem 0 0.1rem;
   overflow: visible;
 }
 
-.orb-dock {
+.orb-hit {
   display: flex;
   flex-direction: column;
   align-items: center;
+  border: 0;
+  background: transparent;
+  padding: 0.45rem 1.75rem 0.2rem;
+  color: inherit;
+  border-radius: 999px;
 }
 
 .orb {
@@ -299,7 +282,7 @@ select:disabled {
   box-shadow: none;
 }
 
-.orb:active:not(:disabled) {
+.orb-hit:active .orb {
   transform: scale(0.97);
 }
 
@@ -331,9 +314,9 @@ select:disabled {
 .orb-caption {
   margin: 0.55rem 0 0;
   font-size: 0.78rem;
-  font-weight: 600;
+  font-weight: 650;
   letter-spacing: -0.01em;
-  color: var(--faint);
+  color: var(--muted);
 }
 
 .orb.is-live + .orb-caption {
@@ -360,7 +343,6 @@ select:disabled {
     opacity: 0;
   }
 }
-
 
 .arm {
   flex: 1;
@@ -402,21 +384,6 @@ select:disabled {
   letter-spacing: -0.02em;
 }
 
-.mute {
-  margin-top: 0.35rem;
-  min-height: 2.75rem;
-  padding: 0.45rem 0.85rem;
-  border: 0;
-  border-radius: 999px;
-  background: transparent;
-  color: var(--muted);
-  font-size: 0.82rem;
-  font-weight: 650;
-  letter-spacing: -0.02em;
-  text-decoration: underline;
-  text-underline-offset: 3px;
-}
-
 .foot {
   flex: none;
   margin: 0.15rem 0 0;
@@ -450,9 +417,13 @@ select:focus-visible,
 .foot-link:focus-visible,
 .text-btn:focus-visible,
 .swap:focus-visible,
-.mute:focus-visible,
+.orb-hit:focus-visible,
 .arm:focus-visible {
   border-radius: 6px;
+}
+
+.orb-hit:focus-visible {
+  border-radius: 999px;
 }
 
 @media (max-height: 540px) {
@@ -461,8 +432,16 @@ select:focus-visible,
     height: 4.75rem;
   }
 
-  .hero {
-    font-size: clamp(1.7rem, 7vw, 2.2rem);
+  .result {
+    font-size: 1.65rem;
+  }
+
+  .stage-inner {
+    padding: 0.7rem 0.1rem 0.9rem;
+  }
+
+  .source-line {
+    margin-top: 0.9rem;
   }
 
   .arm {
@@ -471,11 +450,6 @@ select:focus-visible,
 
   .arm-hint {
     font-size: 1.2rem;
-  }
-
-  .mute {
-    margin-top: 0.2rem;
-    min-height: 2.25rem;
   }
 }
 

@@ -9,24 +9,90 @@ export function isSpeechRecognitionSupported(): boolean {
   return getSpeechRecognitionConstructor() !== null
 }
 
+/** One entry in the current recognition session's result list. */
+export interface SpeechPart {
+  transcript: string
+  isFinal: boolean
+}
+
 export interface RecognitionHandlers {
-  /** Full transcript of the current recognition session (finals + interim). */
-  onLine: (sessionText: string) => void
+  /**
+   * The session's result list, item by item.
+   * The UI keeps only the slice after the last committed phrase.
+   */
+  onParts: (parts: SpeechPart[]) => void
   onError: (message: string) => void
   onStart: () => void
   onEnd: () => void
 }
 
+export interface RecognitionController {
+  /** Call from a user gesture so the browser allows the microphone. */
+  start: () => void
+  /**
+   * End this session now. Results that arrive afterward are dropped.
+   * This instance will not auto-restart.
+   */
+  halt: () => void
+}
+
 /**
- * Continuous SpeechRecognition with interimResults.
- * Caller owns start/stop. Unexpected end restarts only while `shouldRun` is true.
- * Do not stop() on a timer — that cuts the speaker off. The UI debounces a stable line instead.
+ * Transcript of results[fromIndex..]. That slice is one phrase once earlier
+ * results have been consumed. Never falls back to the whole session.
+ */
+export function phraseText(parts: readonly SpeechPart[], fromIndex: number): string {
+  let full = ''
+  const start = fromIndex > 0 ? fromIndex : 0
+  for (let i = start; i < parts.length; i++) {
+    const chunk = parts[i]?.transcript ?? ''
+    if (!chunk) continue
+    if (full && !/\s$/.test(full) && !/^\s/.test(chunk)) full += ' '
+    full += chunk
+  }
+  return full.replace(/\s+/g, ' ').trim()
+}
+
+function snapshot(event: SpeechRecognitionEvent): SpeechPart[] {
+  const parts: SpeechPart[] = []
+  const list = event.results
+  for (let i = 0; i < list.length; i++) {
+    const result = list[i]
+    parts.push({
+      transcript: result?.[0]?.transcript ?? '',
+      isFinal: Boolean(result?.isFinal),
+    })
+  }
+  return parts
+}
+
+/** abort() while Chrome is still starting is often ignored and does not throw. */
+function forceAbort(recognition: SpeechRecognition) {
+  try {
+    recognition.abort()
+  } catch {
+    try {
+      recognition.stop()
+    } catch {
+      /* not started */
+    }
+  }
+}
+
+/**
+ * Continuous recognition with interim results.
+ * Unexpected end restarts only while `shouldRun` is true and halt() was not called.
+ * Do not stop the engine on a pause timer — that cuts the speaker off.
+ * The UI slices a phrase after ~600ms of silence instead.
+ *
+ * Chrome ignores stop()/abort() in the "starting" state, then delivers onstart
+ * and keeps the mic. halt() prefers abort(), and onstart aborts again if the
+ * session was already given up so the mic cannot outlive the muted UI.
  */
 export function createRecognition(
   lang: string,
   handlers: RecognitionHandlers,
   shouldRun: () => boolean,
-): SpeechRecognition | null {
+): RecognitionController | null {
   const Ctor = getSpeechRecognitionConstructor()
   if (!Ctor) return null
 
@@ -36,19 +102,26 @@ export function createRecognition(
   recognition.lang = lang
   recognition.maxAlternatives = 1
 
-  recognition.onstart = () => handlers.onStart()
+  let halted = false
+  const givenUp = () => halted || !shouldRun()
+
+  recognition.onstart = () => {
+    if (givenUp()) {
+      forceAbort(recognition)
+      return
+    }
+    handlers.onStart()
+  }
 
   recognition.onresult = (event: SpeechRecognitionEvent) => {
-    // Whole session, not only resultIndex, so the heard line is the current hypothesis.
-    let full = ''
-    for (let i = 0; i < event.results.length; i++) {
-      full += event.results[i][0]?.transcript ?? ''
-    }
-    const text = full.replace(/\s+/g, ' ').trim()
-    if (text) handlers.onLine(text)
+    if (givenUp()) return
+    const parts = snapshot(event)
+    if (parts.length === 0) return
+    handlers.onParts(parts)
   }
 
   recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
+    if (halted) return
     const err = event.error
     if (err === 'aborted' || err === 'no-speech') return
     if (err === 'not-allowed') {
@@ -64,14 +137,22 @@ export function createRecognition(
 
   recognition.onend = () => {
     handlers.onEnd()
-    if (shouldRun()) {
-      try {
-        recognition.start()
-      } catch {
-        // Ignored — may already be starting
-      }
+    if (givenUp()) return
+    try {
+      recognition.start()
+    } catch {
+      // Already starting, or halt() landed during end.
     }
   }
 
-  return recognition
+  return {
+    start() {
+      if (halted) return
+      recognition.start()
+    },
+    halt() {
+      halted = true
+      forceAbort(recognition)
+    },
+  }
 }
