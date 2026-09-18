@@ -266,8 +266,9 @@ select:disabled {
 .dock {
   flex: none;
   display: flex;
-  justify-content: center;
-  padding: 0.35rem 0 0.1rem;
+  flex-direction: column;
+  align-items: center;
+  padding: 0.15rem 0 0.1rem;
   overflow: visible;
 }
 
@@ -279,6 +280,7 @@ select:disabled {
 
 .orb {
   position: relative;
+  flex: none;
   width: 6.5rem;
   height: 6.5rem;
   border: 0;
@@ -287,10 +289,13 @@ select:disabled {
   background: var(--ink);
   box-shadow: 0 12px 30px rgba(28, 27, 25, 0.16);
   overflow: visible;
+  pointer-events: none;
 }
 
-.orb:disabled {
-  opacity: 0.35;
+.orb:disabled,
+.arm:disabled .orb,
+.orb.is-muted {
+  opacity: 0.4;
   box-shadow: none;
 }
 
@@ -356,6 +361,62 @@ select:disabled {
   }
 }
 
+
+.arm {
+  flex: 1;
+  width: 100%;
+  min-height: 0;
+  margin: 0;
+  border: 0;
+  background: transparent;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1.75rem;
+  padding: 1rem 0.25rem 1.25rem;
+  color: inherit;
+  text-align: center;
+}
+
+.arm-copy {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.4rem;
+  max-width: 16rem;
+}
+
+.arm-hint {
+  color: var(--ink);
+  font-size: 1.45rem;
+  font-weight: 650;
+  letter-spacing: -0.03em;
+  line-height: 1.35;
+}
+
+.arm-sub {
+  color: var(--muted);
+  font-size: 0.92rem;
+  font-weight: 500;
+  letter-spacing: -0.02em;
+}
+
+.mute {
+  margin-top: 0.35rem;
+  min-height: 2.75rem;
+  padding: 0.45rem 0.85rem;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 0.82rem;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
 .foot {
   flex: none;
   margin: 0.15rem 0 0;
@@ -388,7 +449,9 @@ select:disabled {
 select:focus-visible,
 .foot-link:focus-visible,
 .text-btn:focus-visible,
-.swap:focus-visible {
+.swap:focus-visible,
+.mute:focus-visible,
+.arm:focus-visible {
   border-radius: 6px;
 }
 
@@ -400,6 +463,19 @@ select:focus-visible,
 
   .hero {
     font-size: clamp(1.7rem, 7vw, 2.2rem);
+  }
+
+  .arm {
+    gap: 1rem;
+  }
+
+  .arm-hint {
+    font-size: 1.2rem;
+  }
+
+  .mute {
+    margin-top: 0.2rem;
+    min-height: 2.25rem;
   }
 }
 

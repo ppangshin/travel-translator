@@ -10,16 +10,17 @@ export function isSpeechRecognitionSupported(): boolean {
 }
 
 export interface RecognitionHandlers {
-  onInterim: (text: string) => void
-  onFinal: (text: string) => void
+  /** Full transcript of the current recognition session (finals + interim). */
+  onLine: (sessionText: string) => void
   onError: (message: string) => void
   onStart: () => void
   onEnd: () => void
 }
 
 /**
- * Create a continuous SpeechRecognition instance.
- * Caller owns start/stop; we restart on unexpected end while `shouldRun` is true.
+ * Continuous SpeechRecognition with interimResults.
+ * Caller owns start/stop. Unexpected end restarts only while `shouldRun` is true.
+ * Do not stop() on a timer — that cuts the speaker off. The UI debounces a stable line instead.
  */
 export function createRecognition(
   lang: string,
@@ -38,23 +39,13 @@ export function createRecognition(
   recognition.onstart = () => handlers.onStart()
 
   recognition.onresult = (event: SpeechRecognitionEvent) => {
-    // Walk the whole list so the unfinished phrase is the full current line,
-    // not only the slice after resultIndex.
-    let interim = ''
-    let newlyFinal = ''
+    // Whole session, not only resultIndex, so the heard line is the current hypothesis.
+    let full = ''
     for (let i = 0; i < event.results.length; i++) {
-      const result = event.results[i]
-      const transcript = result[0]?.transcript ?? ''
-      if (result.isFinal) {
-        if (i >= event.resultIndex) newlyFinal += transcript
-      } else {
-        interim += transcript
-      }
+      full += event.results[i][0]?.transcript ?? ''
     }
-    const finalTrimmed = newlyFinal.trim()
-    const interimTrimmed = interim.trim()
-    if (finalTrimmed) handlers.onFinal(finalTrimmed)
-    if (interimTrimmed) handlers.onInterim(interimTrimmed)
+    const text = full.replace(/\s+/g, ' ').trim()
+    if (text) handlers.onLine(text)
   }
 
   recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
@@ -73,7 +64,6 @@ export function createRecognition(
 
   recognition.onend = () => {
     handlers.onEnd()
-    // Auto-restart for continuous listening if still supposed to run
     if (shouldRun()) {
       try {
         recognition.start()

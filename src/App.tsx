@@ -1,15 +1,18 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { DEFAULT_LISTEN, DEFAULT_TARGET, LANGUAGES } from './lib/languages'
 import { createRecognition, isSpeechRecognitionSupported } from './lib/speech'
 import { translate } from './lib/translate'
 import { Privacy } from './pages/Privacy'
 
-/** Wait after the last interim update before calling translate(). */
-const INTERIM_DEBOUNCE_MS = 200
-const FLUSH_MS = 1600
+/**
+ * Translate only after the heard line has been unchanged for this long.
+ * Not on every interim tick, and not by restarting recognition.
+ */
+const PAUSE_MS = 600
 const HISTORY_MAX = 3
 
 type Page = 'home' | 'privacy'
+type HeroMode = 'idle' | 'heard' | 'ko'
 
 interface HistoryItem {
   id: string
@@ -24,32 +27,28 @@ function heroClass(text: string): string {
   return 'hero'
 }
 
-function ListenOrb({
-  listening,
-  disabled,
-  onToggle,
-}: {
-  listening: boolean
-  disabled: boolean
-  onToggle: () => void
-}) {
+/**
+ * Portion of the session said after the last pause-translation.
+ * A missing word boundary means the engine revised the word ("to" → "today"),
+ * so the whole session is the current line again.
+ */
+function tailAfter(session: string, committed: string): string {
+  if (!committed) return session
+  if (session === committed) return ''
+  if (session.startsWith(committed)) {
+    const rest = session.slice(committed.length)
+    if (/^\s/.test(rest)) return rest.trim()
+  }
+  return session
+}
+
+function OrbMark({ live, muted }: { live: boolean; muted?: boolean }) {
+  const className = live ? 'orb is-live' : muted ? 'orb is-muted' : 'orb'
   return (
-    <div className="orb-dock">
-      <button
-        type="button"
-        className={listening ? 'orb is-live' : 'orb'}
-        onClick={onToggle}
-        disabled={disabled}
-        aria-pressed={listening}
-        aria-label={listening ? '듣기 중지' : '듣기 시작'}
-      >
-        <span className="ring r1" aria-hidden="true" />
-        <span className="ring r2" aria-hidden="true" />
-        <span className="ring r3" aria-hidden="true" />
-      </button>
-      <p className="orb-caption" aria-hidden="true">
-        {listening ? '중지' : '듣기'}
-      </p>
+    <div className={className} aria-hidden="true">
+      <span className="ring r1" />
+      <span className="ring r2" />
+      <span className="ring r3" />
     </div>
   )
 }
@@ -58,10 +57,12 @@ export default function App() {
   const [page, setPage] = useState<Page>('home')
   const [listenLang, setListenLang] = useState(DEFAULT_LISTEN)
   const [targetLang, setTargetLang] = useState(DEFAULT_TARGET)
+  const [armed, setArmed] = useState(false)
   const [listening, setListening] = useState(false)
-  const [interimSource, setInterimSource] = useState('')
-  const [lastSource, setLastSource] = useState('')
+  const [heard, setHeard] = useState('')
+  const [settledSource, setSettledSource] = useState('')
   const [translation, setTranslation] = useState('')
+  const [heroMode, setHeroMode] = useState<HeroMode>('idle')
   const [error, setError] = useState<string | null>(null)
   const [history, setHistory] = useState<HistoryItem[]>([])
 
@@ -71,178 +72,172 @@ export default function App() {
   const wantListenRef = useRef(false)
   const listenLangRef = useRef(listenLang)
   const targetLangRef = useRef(targetLang)
-  const interimTimerRef = useRef<number | null>(null)
-  const interimSourceRef = useRef('')
-  const scheduledTextRef = useRef('')
-  // Request generation id — a slower earlier translate() must not overwrite a newer one.
+  const heardRef = useRef('')
+  const sessionRef = useRef('')
+  const committedSessionRef = useRef('')
+  const settledSourceRef = useRef('')
+  const settledTranslationRef = useRef('')
+  // Bumped when the heard line changes so a slower earlier translate() cannot paint over a newer line.
   const requestGenRef = useRef(0)
-  const inflightTextRef = useRef('')
-  const shownSourceRef = useRef('')
-  const shownTranslationRef = useRef('')
-  const historyWaitRef = useRef<string | null>(null)
+  const inflightRef = useRef('')
+  const inflightGenRef = useRef(0)
+  const pendingLineRef = useRef('')
+  const pauseTimerRef = useRef<number | null>(null)
   const lastSavedRef = useRef({ source: '', at: 0 })
   const seqRef = useRef(0)
   const aliveRef = useRef(true)
-  const flushTimerRef = useRef<number | null>(null)
-  const [matchedSource, setMatchedSource] = useState('')
+  const handleSessionRef = useRef<(session: string) => void>(() => {})
+  const stopRef = useRef<() => void>(() => {})
 
   useEffect(() => {
     listenLangRef.current = listenLang
     targetLangRef.current = targetLang
   }, [listenLang, targetLang])
 
-  const clearInterimTimer = useCallback(() => {
-    if (interimTimerRef.current !== null) {
-      window.clearTimeout(interimTimerRef.current)
-      interimTimerRef.current = null
+  function clearPause() {
+    if (pauseTimerRef.current !== null) {
+      window.clearTimeout(pauseTimerRef.current)
+      pauseTimerRef.current = null
     }
-  }, [])
+  }
 
-  const commitHistory = useCallback((source: string, translated: string) => {
+  function commitHistory(source: string, translated: string) {
     const now = Date.now()
     if (lastSavedRef.current.source === source && now - lastSavedRef.current.at < 1200) return
     lastSavedRef.current = { source, at: now }
     const id = `${now}-${++seqRef.current}`
     setHistory((prev) => [{ id, source, translation: translated }, ...prev].slice(0, HISTORY_MAX))
-  }, [])
+  }
 
-  const updateDisplay = useCallback(
-    async (raw: string) => {
-      const text = raw.trim()
-      if (!text) return
-      if (text === shownSourceRef.current && shownTranslationRef.current) return
-      if (text === inflightTextRef.current) return
-
-      const requestId = ++requestGenRef.current
-      inflightTextRef.current = text
-
-      const result = await translate(text, listenLangRef.current, targetLangRef.current)
-      if (!aliveRef.current) return
-
-      const fresh = requestId === requestGenRef.current
-      if (fresh) inflightTextRef.current = ''
-
-      if (historyWaitRef.current === text) {
-        if (result.ok) commitHistory(text, result.text)
-        historyWaitRef.current = null
-      }
-
-      if (!fresh) return
-      if (!result.ok) {
-        setError(result.message)
-        return
-      }
-
-      setError(null)
-      setTranslation(result.text)
-      setMatchedSource(text)
-      shownSourceRef.current = text
-      shownTranslationRef.current = result.text
-    },
-    [commitHistory],
-  )
-
-  const translateFinal = useCallback(
-    async (raw: string) => {
-      const text = raw.trim()
-      if (!text) return
-
-      if (text === shownSourceRef.current && shownTranslationRef.current) {
-        commitHistory(text, shownTranslationRef.current)
-        return
-      }
-
-      if (text === inflightTextRef.current) {
-        historyWaitRef.current = text
-        return
-      }
-
-      if (historyWaitRef.current === text) historyWaitRef.current = null
-
-      const requestId = ++requestGenRef.current
-      inflightTextRef.current = text
-
-      const result = await translate(text, listenLangRef.current, targetLangRef.current)
-      if (!aliveRef.current) return
-
-      const fresh = requestId === requestGenRef.current
-      if (fresh) inflightTextRef.current = ''
-
-      if (!result.ok) {
-        if (fresh) setError(result.message)
-        return
-      }
-
-      commitHistory(text, result.text)
-      if (!fresh) return
-
-      setError(null)
-      setTranslation(result.text)
-      setMatchedSource(text)
-      shownSourceRef.current = text
-      shownTranslationRef.current = result.text
-    },
-    [commitHistory],
-  )
-
-  const scheduleInterim = useCallback(
-    (raw: string) => {
-      const text = raw.trim()
-      if (!text) return
-      if (text === scheduledTextRef.current && interimTimerRef.current !== null) return
-      if (text === shownSourceRef.current && shownTranslationRef.current) return
-
-      scheduledTextRef.current = text
-      clearInterimTimer()
-      interimTimerRef.current = window.setTimeout(() => {
-        interimTimerRef.current = null
-        void updateDisplay(text)
-      }, INTERIM_DEBOUNCE_MS)
-    },
-    [clearInterimTimer, updateDisplay],
-  )
-
-  const clearFlush = useCallback(() => {
-    if (flushTimerRef.current !== null) {
-      window.clearInterval(flushTimerRef.current)
-      flushTimerRef.current = null
+  async function translatePaused(line: string, gen: number, sessionAt: string) {
+    const text = line.trim()
+    if (!text) return
+    if (gen !== requestGenRef.current) return
+    if (text === settledSourceRef.current && settledTranslationRef.current) {
+      if (heardRef.current === text) setHeroMode('ko')
+      return
     }
-  }, [])
+    if (inflightRef.current === text && inflightGenRef.current === gen) return
 
-  const stopListening = useCallback(() => {
+    inflightRef.current = text
+    inflightGenRef.current = gen
+
+    const result = await translate(text, listenLangRef.current, targetLangRef.current)
+    if (!aliveRef.current) return
+    if (inflightRef.current === text) inflightRef.current = ''
+
+    // Stale: the speaker already moved on, or a newer request owns the screen.
+    if (gen !== requestGenRef.current) return
+    if (heardRef.current !== text) return
+    if (!result.ok) {
+      setError(result.message)
+      return
+    }
+
+    if (sessionRef.current === sessionAt) committedSessionRef.current = sessionAt
+    settledSourceRef.current = text
+    settledTranslationRef.current = result.text
+    setSettledSource(text)
+    setTranslation(result.text)
+    setHeroMode('ko')
+    setError(null)
+    commitHistory(text, result.text)
+  }
+
+  function schedulePause(line: string) {
+    if (
+      line === settledSourceRef.current &&
+      settledTranslationRef.current &&
+      heardRef.current === line
+    ) {
+      setHeroMode('ko')
+      return
+    }
+    if (pendingLineRef.current === line && pauseTimerRef.current !== null) return
+
+    clearPause()
+    pendingLineRef.current = line
+    const gen = requestGenRef.current
+    const sessionAt = sessionRef.current
+    pauseTimerRef.current = window.setTimeout(() => {
+      pauseTimerRef.current = null
+      void translatePaused(line, gen, sessionAt)
+    }, PAUSE_MS)
+  }
+
+  function presentLine(line: string) {
+    if (
+      line === heardRef.current &&
+      line === settledSourceRef.current &&
+      settledTranslationRef.current
+    ) {
+      setHeroMode('ko')
+      return
+    }
+
+    if (line !== heardRef.current) {
+      heardRef.current = line
+      setHeard(line)
+      setHeroMode('heard')
+      requestGenRef.current += 1
+    }
+    schedulePause(line)
+  }
+
+  function handleSession(raw: string) {
+    if (!wantListenRef.current) return
+    const session = raw.replace(/\s+/g, ' ').trim()
+    if (!session) return
+    sessionRef.current = session
+
+    const committed = committedSessionRef.current
+    if (committed && session !== committed && !session.startsWith(committed)) {
+      committedSessionRef.current = ''
+    }
+
+    const line = tailAfter(session, committedSessionRef.current)
+    if (!line) return
+    presentLine(line)
+  }
+
+  function stopListening() {
+    const line = heardRef.current.trim()
+    const gen = requestGenRef.current
+    const sessionAt = sessionRef.current
+    const needsTail =
+      Boolean(line) && !(line === settledSourceRef.current && settledTranslationRef.current)
+
     wantListenRef.current = false
     setListening(false)
-    clearFlush()
-    clearInterimTimer()
-
-    const tail = interimSourceRef.current.trim()
-    interimSourceRef.current = ''
-    scheduledTextRef.current = ''
-    setInterimSource('')
+    clearPause()
 
     const rec = recognitionRef.current
     recognitionRef.current = null
     if (rec) {
       try {
         rec.onend = null
+        rec.onresult = null
+        rec.onerror = null
         rec.stop()
       } catch {
         /* ignore */
       }
     }
 
-    if (tail) void updateDisplay(tail)
-  }, [clearFlush, clearInterimTimer, updateDisplay])
+    // Mute is not how you ask for a translation; this only keeps a trailing phrase.
+    if (needsTail) void translatePaused(line, gen, sessionAt)
+  }
 
-  const startListening = useCallback(() => {
-    if (!isSpeechRecognitionSupported()) return
+  function startListening(): boolean {
+    if (!isSpeechRecognitionSupported()) return false
 
-    wantListenRef.current = false
     const prev = recognitionRef.current
     recognitionRef.current = null
     if (prev) {
       try {
         prev.onend = null
+        prev.onresult = null
+        prev.onerror = null
         prev.stop()
       } catch {
         /* ignore */
@@ -250,37 +245,31 @@ export default function App() {
     }
 
     wantListenRef.current = true
+    sessionRef.current = ''
+    committedSessionRef.current = ''
     setError(null)
 
     const recognition = createRecognition(
       listenLangRef.current,
       {
-        onStart: () => setListening(true),
+        onStart: () => {
+          if (!wantListenRef.current) return
+          setListening(true)
+          sessionRef.current = ''
+          committedSessionRef.current = ''
+        },
         onEnd: () => {
           if (!wantListenRef.current) setListening(false)
         },
-        onInterim: (text) => {
-          const next = text.trim()
-          if (!next) return
-          interimSourceRef.current = next
-          setInterimSource(next)
-          scheduleInterim(next)
-        },
-        onFinal: (text) => {
-          const next = text.trim()
-          if (!next) return
-          clearInterimTimer()
-          scheduledTextRef.current = ''
-          interimSourceRef.current = ''
-          setInterimSource('')
-          setLastSource(next)
-          void translateFinal(next)
+        onLine: (session) => {
+          handleSessionRef.current(session)
         },
         onError: (message) => {
           setError(message)
           if (message.includes('권한이 거부')) {
             wantListenRef.current = false
             setListening(false)
+            setArmed(false)
           }
         },
       },
@@ -290,59 +279,66 @@ export default function App() {
     if (!recognition) {
       setError('음성 인식을 시작할 수 없어요.')
       wantListenRef.current = false
-      return
+      setListening(false)
+      return false
     }
 
     recognitionRef.current = recognition
     try {
+      // Must stay inside the tap handler so the browser allows the mic.
       recognition.start()
       setListening(true)
-      clearFlush()
-      // Chrome often holds the transcript until stop. Nudge a boundary so a
-      // translation can appear without the user tapping the button again.
-      flushTimerRef.current = window.setInterval(() => {
-        if (!wantListenRef.current) return
-        const live = recognitionRef.current
-        if (!live) return
-        try {
-          live.stop()
-        } catch {
-          /* restart happens in onend while wantListen is true */
-        }
-      }, FLUSH_MS)
+      return true
     } catch {
       recognitionRef.current = null
       wantListenRef.current = false
       setListening(false)
       setError('음성 인식을 시작할 수 없어요. 잠시 후 다시 시도해 주세요.')
+      return false
     }
-  }, [clearFlush, clearInterimTimer, scheduleInterim, translateFinal])
+  }
 
-  // Stop when the tab is hidden. Do not stop on window blur — that breaks mobile.
+  /**
+   * The one mic gesture. Browsers will not open the mic without it.
+   * After this, listening stays on until mute. The orb is not a record toggle.
+   */
+  function startFromGesture() {
+    if (!isSpeechRecognitionSupported()) return
+    if (wantListenRef.current) return
+    const ok = startListening()
+    setArmed(ok)
+  }
+
+  useEffect(() => {
+    handleSessionRef.current = handleSession
+    stopRef.current = stopListening
+  })
+
   useEffect(() => {
     const onVisibility = () => {
       if (document.visibilityState === 'hidden' && wantListenRef.current) {
-        stopListening()
+        stopRef.current()
       }
     }
     document.addEventListener('visibilitychange', onVisibility)
     return () => document.removeEventListener('visibilitychange', onVisibility)
-  }, [stopListening])
+  }, [])
 
   useEffect(() => {
     aliveRef.current = true
     return () => {
       aliveRef.current = false
       wantListenRef.current = false
-      if (interimTimerRef.current !== null) {
-        window.clearTimeout(interimTimerRef.current)
-        interimTimerRef.current = null
+      if (pauseTimerRef.current !== null) {
+        window.clearTimeout(pauseTimerRef.current)
+        pauseTimerRef.current = null
       }
       const rec = recognitionRef.current
       recognitionRef.current = null
       if (rec) {
         try {
           rec.onend = null
+          rec.onresult = null
           rec.abort()
         } catch {
           /* ignore */
@@ -350,12 +346,6 @@ export default function App() {
       }
     }
   }, [])
-
-  const toggleListen = () => {
-    if (!supported) return
-    if (wantListenRef.current) stopListening()
-    else startListening()
-  }
 
   const swapLanguages = () => {
     if (wantListenRef.current) return
@@ -377,14 +367,20 @@ export default function App() {
     return <Privacy onBack={() => setPage('home')} />
   }
 
-  const heard = interimSource || lastSource
-  const pending = Boolean(interimSource && interimSource !== matchedSource)
-  const hint = !supported
-    ? 'Chrome에서만 들을 수 있어요'
-    : listening
-      ? '듣는 중'
-      : '아래를 눌러 들으세요'
-  const heroText = pending ? interimSource : translation || hint
+  const showingHeard = heroMode === 'heard' && heard.length > 0
+  const showingKo = heroMode === 'ko' && translation.length > 0
+  const heroText = showingHeard
+    ? heard
+    : showingKo
+      ? translation
+      : listening
+        ? '듣는 중'
+        : '음소거됨'
+  const heroClassName = showingHeard
+    ? `${heroClass(heard)} is-pending`
+    : showingKo
+      ? heroClass(translation)
+      : 'hero-hint'
 
   return (
     <div className="screen">
@@ -420,7 +416,7 @@ export default function App() {
             onChange={(e) => setTargetLang(e.target.value)}
           >
             {LANGUAGES.map((lang) => (
-              <option key={lang.code} value={lang.code}>
+              <option key={`to-${lang.code}`} value={lang.code}>
                 {lang.labelKo}
               </option>
             ))}
@@ -438,59 +434,93 @@ export default function App() {
         </button>
       </header>
 
-      <main className="stage">
-        <div className="stage-inner">
-          <p
-            className={
-              pending
-                ? `${heroClass(interimSource)} is-pending`
-                : translation
-                  ? heroClass(translation)
-                  : 'hero-hint'
-            }
-            aria-live="polite"
-            lang={pending ? listenLang : translation ? targetLang : 'ko'}
-          >
-            {heroText}
-          </p>
-
-          {heard && (
-            <p className="heard" lang={listenLang}>
-              <span className="sr-only">들린 말 </span>
-              {heard}
-            </p>
-          )}
-
+      {!armed ? (
+        <button
+          type="button"
+          className="arm"
+          onClick={startFromGesture}
+          disabled={!supported}
+        >
+          <span className="arm-copy">
+            <span className={supported ? 'arm-hint' : 'hero-hint'}>
+              {supported ? '화면을 눌러 듣기' : 'Chrome에서만 들을 수 있어요'}
+            </span>
+            {supported && (
+              <span className="arm-sub" aria-hidden="true">
+                말이 멈추면 번역돼요
+              </span>
+            )}
+          </span>
+          <OrbMark live={false} />
           {error && (
-            <p className="err" role="alert">
+            <span className="err" role="alert">
               {error}
-            </p>
+            </span>
           )}
-        </div>
-      </main>
+        </button>
+      ) : (
+        <>
+          <main className="stage">
+            <div className="stage-inner">
+              <p
+                className={heroClassName}
+                aria-live="polite"
+                lang={showingHeard ? listenLang : showingKo ? targetLang : 'ko'}
+              >
+                {heroText}
+              </p>
 
-      {history.length > 0 && (
-        <section className="recent" aria-label="최근 번역">
-          <div className="recent-head">
-            <span className="recent-label">최근</span>
-            <button type="button" className="text-btn" onClick={clearHistory}>
-              지우기
-            </button>
+              {showingKo && settledSource && (
+                <p className="heard" lang={listenLang}>
+                  <span className="sr-only">들린 말 </span>
+                  {settledSource}
+                </p>
+              )}
+
+              {error && (
+                <p className="err" role="alert">
+                  {error}
+                </p>
+              )}
+            </div>
+          </main>
+
+          {history.length > 0 && (
+            <section className="recent" aria-label="최근 번역">
+              <div className="recent-head">
+                <span className="recent-label">최근</span>
+                <button type="button" className="text-btn" onClick={clearHistory}>
+                  지우기
+                </button>
+              </div>
+              <ul>
+                {history.map((item) => (
+                  <li key={item.id}>
+                    <p className="recent-tr">{item.translation}</p>
+                    <p className="recent-src">{item.source}</p>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+
+          <div className="dock">
+            <div className="orb-dock">
+              <OrbMark live={listening} muted={!listening} />
+              <p className="orb-caption" aria-hidden="true">
+                {listening ? '듣는 중' : '음소거됨'}
+              </p>
+              <button
+                type="button"
+                className="mute"
+                onClick={listening ? stopListening : startFromGesture}
+              >
+                {listening ? '음소거' : '다시 듣기'}
+              </button>
+            </div>
           </div>
-          <ul>
-            {history.map((item) => (
-              <li key={item.id}>
-                <p className="recent-tr">{item.translation}</p>
-                <p className="recent-src">{item.source}</p>
-              </li>
-            ))}
-          </ul>
-        </section>
+        </>
       )}
-
-      <div className="dock">
-        <ListenOrb listening={listening} disabled={!supported} onToggle={toggleListen} />
-      </div>
 
       <footer className="foot">
         <p>
