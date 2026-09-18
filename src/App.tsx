@@ -5,13 +5,11 @@ import { translate } from './lib/translate'
 import { Privacy } from './pages/Privacy'
 
 /**
- * One record control. Interim words stay a quiet source line.
- * When that phrase has been still for ~1.1s, it becomes one translation line
- * and is translated once. The mic stays on; the next words start a new line.
- * Stop bumps the generation, halt() aborts the mic, and commits leftover words.
+ * One record control. While the mic is on, only the heard words are shown.
+ * Translation runs once, for the whole take, when recording stops.
+ * Stop bumps the generation and halt() aborts the mic so a late result cannot restart it.
  */
 
-const STILL_MS = 1100
 const NOTHING_HEARD = '들린 말이 없어요.'
 
 type Page = 'home' | 'privacy'
@@ -139,18 +137,6 @@ export default function App() {
     void translateLine(id, text, from, to)
   }
 
-  function armStill(generation: number) {
-    clearPause()
-    const snapshot = transcriptRef.current
-    pauseTimerRef.current = window.setTimeout(() => {
-      pauseTimerRef.current = null
-      if (!aliveRef.current) return
-      if (generationRef.current !== generation || !wantListenRef.current) return
-      if (transcriptRef.current !== snapshot) return
-      commitPhrase(snapshot)
-    }, STILL_MS)
-  }
-
   async function translateLine(id: string, text: string, from: string, to: string) {
     const result = await translate(text, from, to)
     if (!aliveRef.current) return
@@ -220,7 +206,7 @@ export default function App() {
           if (transcript === transcriptRef.current) return
           transcriptRef.current = transcript
           const phrase = uncommitted(transcript, baseRef.current)
-          // Do not translate interim words. A still phrase commits once.
+          // Heard words only. Translation waits for stop.
           if (!hasWords(phrase)) {
             const t = tidy(transcript)
             const b = tidy(baseRef.current)
@@ -230,7 +216,6 @@ export default function App() {
             return
           }
           setDraft(phrase)
-          armStill(generation)
         },
         onError: (message) => {
           if (!aliveRef.current) return
@@ -360,8 +345,9 @@ export default function App() {
   const showIdle = lines.length === 0 && !recording && !error && !hasWords(draft)
   const idleHint = !supported
     ? 'Chrome에서만 들을 수 있어요'
-    : (notice ?? '녹음하면 문장마다 번역해요')
+    : (notice ?? '녹음하고 멈추면 번역해요')
   const buttonLabel = recording ? '중지' : '녹음'
+  const last = lines.length > 0 ? lines[lines.length - 1] : undefined
 
   return (
     <div className="screen">
@@ -427,31 +413,29 @@ export default function App() {
         <div className="sheet-inner">
           {showIdle && <p className="hint">{idleHint}</p>}
 
-          <div className="lines">
-            {lines.map((line) => (
-              <article key={line.id} className="line">
-                <p className="src" lang={line.sourceLang}>
-                  {line.source}
-                </p>
-                {line.pending && <p className="pending">번역 중</p>}
-                {!line.pending && line.translation && (
-                  <p className="tr" lang={line.targetLang}>
-                    {line.translation}
-                  </p>
-                )}
-                {line.error && (
-                  <p className="line-err" role="alert">
-                    {line.error}
-                  </p>
-                )}
-              </article>
-            ))}
-          </div>
-
           {recording && (
-            <p className={draft ? 'draft' : 'draft is-wait'} lang={listenLang} aria-live="off">
+            <p className={draft ? 'tr live-heard' : 'draft is-wait'} lang={listenLang} aria-live="off">
               {draft || '듣는 중'}
             </p>
+          )}
+
+          {!recording && last && (
+            <article className="hero-block">
+              {last.pending && <p className="pending">번역 중</p>}
+              {!last.pending && last.translation && (
+                <p className="tr" lang={last.targetLang}>
+                  {last.translation}
+                </p>
+              )}
+              {last.error && (
+                <p className="line-err" role="alert">
+                  {last.error}
+                </p>
+              )}
+              <p className="src" lang={last.sourceLang}>
+                {last.source}
+              </p>
+            </article>
           )}
 
           {error && (
@@ -464,7 +448,7 @@ export default function App() {
 
       <div className="dock">
         <p id="rec-state" className="rec-state" aria-hidden={recording ? undefined : true}>
-          {recording ? '말이 끊기면 번역' : '\u00a0'}
+          {recording ? '멈추면 번역' : '\u00a0'}
         </p>
         <button
           type="button"

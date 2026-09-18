@@ -181,8 +181,8 @@ select:disabled {
   min-height: 100%;
   display: flex;
   flex-direction: column;
-  justify-content: flex-end;
-  padding: 0.35rem 0.05rem 0.45rem;
+  justify-content: center;
+  padding: 0.5rem 0.1rem 0.6rem;
   text-align: left;
 }
 
@@ -206,11 +206,15 @@ select:disabled {
   border-top: 1px solid var(--line);
 }
 
+.hero-block {
+  max-width: 20rem;
+}
+
 .src {
-  margin: 0;
+  margin: 0.7rem 0 0;
   color: var(--muted);
-  font-size: 0.84rem;
-  font-weight: 550;
+  font-size: 0.86rem;
+  font-weight: 500;
   line-height: 1.45;
   letter-spacing: -0.01em;
   text-align: left;
@@ -218,13 +222,20 @@ select:disabled {
   overflow-wrap: anywhere;
 }
 
-.tr {
-  margin: 0.22rem 0 0;
+.live-heard {
+  margin: 0;
+  max-width: 20rem;
   color: var(--ink);
-  font-size: 1.58rem;
-  font-weight: 650;
-  line-height: 1.48;
-  letter-spacing: -0.03em;
+  word-break: break-word;
+}
+
+.tr {
+  margin: 0;
+  color: var(--ink);
+  font-size: clamp(1.7rem, 7.2vw, 2.15rem);
+  font-weight: 550;
+  line-height: 1.55;
+  letter-spacing: -0.035em;
   text-align: left;
   text-wrap: pretty;
   word-break: keep-all;
