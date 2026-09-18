@@ -38,17 +38,20 @@ export function createRecognition(
   recognition.onstart = () => handlers.onStart()
 
   recognition.onresult = (event: SpeechRecognitionEvent) => {
+    // Walk the whole list so the unfinished phrase is the full current line,
+    // not only the slice after resultIndex.
     let interim = ''
-    let finalText = ''
-    for (let i = event.resultIndex; i < event.results.length; i++) {
+    let newlyFinal = ''
+    for (let i = 0; i < event.results.length; i++) {
       const result = event.results[i]
       const transcript = result[0]?.transcript ?? ''
-      if (result.isFinal) finalText += transcript
-      else interim += transcript
+      if (result.isFinal) {
+        if (i >= event.resultIndex) newlyFinal += transcript
+      } else {
+        interim += transcript
+      }
     }
-    // Final first, then interim. A mixed event must not drop the new partial
-    // after the app clears the debounce for the phrase that just finished.
-    const finalTrimmed = finalText.trim()
+    const finalTrimmed = newlyFinal.trim()
     const interimTrimmed = interim.trim()
     if (finalTrimmed) handlers.onFinal(finalTrimmed)
     if (interimTrimmed) handlers.onInterim(interimTrimmed)

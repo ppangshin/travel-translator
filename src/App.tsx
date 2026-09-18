@@ -5,7 +5,8 @@ import { translate } from './lib/translate'
 import { Privacy } from './pages/Privacy'
 
 /** Wait after the last interim update before calling translate(). */
-const INTERIM_DEBOUNCE_MS = 400
+const INTERIM_DEBOUNCE_MS = 200
+const FLUSH_MS = 1600
 const HISTORY_MAX = 3
 
 type Page = 'home' | 'privacy'
@@ -82,6 +83,8 @@ export default function App() {
   const lastSavedRef = useRef({ source: '', at: 0 })
   const seqRef = useRef(0)
   const aliveRef = useRef(true)
+  const flushTimerRef = useRef<number | null>(null)
+  const [matchedSource, setMatchedSource] = useState('')
 
   useEffect(() => {
     listenLangRef.current = listenLang
@@ -132,6 +135,7 @@ export default function App() {
 
       setError(null)
       setTranslation(result.text)
+      setMatchedSource(text)
       shownSourceRef.current = text
       shownTranslationRef.current = result.text
     },
@@ -174,6 +178,7 @@ export default function App() {
 
       setError(null)
       setTranslation(result.text)
+      setMatchedSource(text)
       shownSourceRef.current = text
       shownTranslationRef.current = result.text
     },
@@ -197,9 +202,17 @@ export default function App() {
     [clearInterimTimer, updateDisplay],
   )
 
+  const clearFlush = useCallback(() => {
+    if (flushTimerRef.current !== null) {
+      window.clearInterval(flushTimerRef.current)
+      flushTimerRef.current = null
+    }
+  }, [])
+
   const stopListening = useCallback(() => {
     wantListenRef.current = false
     setListening(false)
+    clearFlush()
     clearInterimTimer()
 
     const tail = interimSourceRef.current.trim()
@@ -219,7 +232,7 @@ export default function App() {
     }
 
     if (tail) void updateDisplay(tail)
-  }, [clearInterimTimer, updateDisplay])
+  }, [clearFlush, clearInterimTimer, updateDisplay])
 
   const startListening = useCallback(() => {
     if (!isSpeechRecognitionSupported()) return
@@ -284,13 +297,26 @@ export default function App() {
     try {
       recognition.start()
       setListening(true)
+      clearFlush()
+      // Chrome often holds the transcript until stop. Nudge a boundary so a
+      // translation can appear without the user tapping the button again.
+      flushTimerRef.current = window.setInterval(() => {
+        if (!wantListenRef.current) return
+        const live = recognitionRef.current
+        if (!live) return
+        try {
+          live.stop()
+        } catch {
+          /* restart happens in onend while wantListen is true */
+        }
+      }, FLUSH_MS)
     } catch {
       recognitionRef.current = null
       wantListenRef.current = false
       setListening(false)
       setError('음성 인식을 시작할 수 없어요. 잠시 후 다시 시도해 주세요.')
     }
-  }, [clearInterimTimer, scheduleInterim, translateFinal])
+  }, [clearFlush, clearInterimTimer, scheduleInterim, translateFinal])
 
   // Stop when the tab is hidden. Do not stop on window blur — that breaks mobile.
   useEffect(() => {
@@ -352,11 +378,13 @@ export default function App() {
   }
 
   const heard = interimSource || lastSource
+  const pending = Boolean(interimSource && interimSource !== matchedSource)
   const hint = !supported
     ? 'Chrome에서만 들을 수 있어요'
     : listening
       ? '듣는 중'
       : '아래를 눌러 들으세요'
+  const heroText = pending ? interimSource : translation || hint
 
   return (
     <div className="screen">
@@ -413,11 +441,17 @@ export default function App() {
       <main className="stage">
         <div className="stage-inner">
           <p
-            className={translation ? heroClass(translation) : 'hero-hint'}
+            className={
+              pending
+                ? `${heroClass(interimSource)} is-pending`
+                : translation
+                  ? heroClass(translation)
+                  : 'hero-hint'
+            }
             aria-live="polite"
-            lang={translation ? targetLang : 'ko'}
+            lang={pending ? listenLang : translation ? targetLang : 'ko'}
           >
-            {translation || hint}
+            {heroText}
           </p>
 
           {heard && (
