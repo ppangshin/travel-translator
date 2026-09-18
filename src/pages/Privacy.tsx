@@ -6,7 +6,7 @@ export function Privacy({ onBack }: PrivacyProps) {
   return (
     <div className="page privacy-page">
       <header className="page-header">
-        <button type="button" className="btn btn-ghost" onClick={onBack}>
+        <button type="button" className="back" onClick={onBack}>
           ← 돌아가기
         </button>
         <h1>개인정보 · 법적 안내</h1>

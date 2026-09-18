@@ -46,8 +46,12 @@ export function createRecognition(
       if (result.isFinal) finalText += transcript
       else interim += transcript
     }
-    if (interim) handlers.onInterim(interim)
-    if (finalText.trim()) handlers.onFinal(finalText.trim())
+    // Final first, then interim. A mixed event must not drop the new partial
+    // after the app clears the debounce for the phrase that just finished.
+    const finalTrimmed = finalText.trim()
+    const interimTrimmed = interim.trim()
+    if (finalTrimmed) handlers.onFinal(finalTrimmed)
+    if (interimTrimmed) handlers.onInterim(interimTrimmed)
   }
 
   recognition.onerror = (event: SpeechRecognitionErrorEvent) => {

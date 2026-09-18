@@ -25,9 +25,9 @@ npm run preview
 
 ## 기능 요약
 
-1. 최초 실행 동의 화면 (마이크 목적, 실시간 번역만, 현지법·동의 책임)
-2. 듣는 언어 기본 영어, 번역 언어 기본 한국어
-3. 듣기 시작/중지, 명확한 청취 표시, 탭 숨김/blur 시 자동 중지
+1. 첫 화면은 통역기 (동의 게이트 없음). 법적 안내는 하단 「개인정보 / 안내」
+2. 듣는 언어 기본 영어, 번역 언어 기본 한국어. 듣기 중에는 언어 변경 불가
+3. 하단 원형 버튼으로 듣기/중지. 말하는 동안 중간 인식도 번역(약 400ms). 탭이 숨겨지면 중지 — 창 blur로는 중지하지 않음
 4. Web Speech API 연속 인식
 5. 무료 클라이언트 번역 (`src/lib/translate.ts` — MyMemory → LibreTranslate 폴백)
 6. 큰 번역 표시 + 짧은 텍스트 기록(지우기 가능)
@@ -54,6 +54,6 @@ Vite + React + TypeScript + plain CSS
 
 ## 주의 / Caveats
 
-- Safari/Firefox는 SpeechRecognition 지원이 제한적일 수 있음
-- 무료 번역 API는 **요청 한도(rate limit)** 가 있어 오류 메시지가 표시될 수 있음
+- Safari/Firefox는 SpeechRecognition 지원이 제한적일 수 있음. iOS의 Chrome도 WebKit이라 음성 인식이 없거나 불안정함
+- 무료 번역 API는 지연과 **요청 한도**가 있어, 중간 번역이 말보다 늦거나 짧은 오류가 날 수 있음
 - 인식·번역 품질은 환경·방음·억양에 따라 달라짐
