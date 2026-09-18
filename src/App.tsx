@@ -357,13 +357,19 @@ export default function App() {
       <main className="stage">
         <div className="stage-inner">
           {big && (
-            <p
-              className={quiet ? 'result result-wait' : 'result'}
-              aria-live={recording ? 'off' : 'polite'}
-              lang={bigLang}
-            >
-              {big}
-            </p>
+            <>
+              {!quiet && !recording && translation && (
+                <p className="kicker">번역</p>
+              )}
+              {recording && heard && <p className="kicker">듣는 중</p>}
+              <p
+                className={quiet ? 'result result-wait' : 'result'}
+                aria-live={recording ? 'off' : 'polite'}
+                lang={bigLang}
+              >
+                {big}
+              </p>
+            </>
           )}
 
           {translating && heard && <p className="stage-note">번역 중</p>}
