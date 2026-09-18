@@ -1,4 +1,4 @@
-/** Web Speech API helpers — structured for more languages later */
+/** Web Speech API — one recording take. The UI translates only after halt(). */
 
 export function getSpeechRecognitionConstructor(): (new () => SpeechRecognition) | null {
   if (typeof window === 'undefined') return null
@@ -15,23 +15,13 @@ export interface SpeechPart {
   isFinal: boolean
 }
 
-/**
- * Where the current sentence starts in the session result list.
- * `taken` is the transcript of `parts[index]` already sent to translation.
- * Chrome often rewrites that same index in place; a length cursor (`parts.length`)
- * skips those words. A null `taken` means the index has not been committed yet.
- */
-export interface PhraseAnchor {
-  index: number
-  taken: string | null
-}
-
 export interface RecognitionHandlers {
   /**
-   * The session's result list, item by item.
-   * The UI keeps the uncommitted sentence, including a rewrite of the boundary result.
+   * Full transcript of this take so far, interim words included.
+   * An engine restart inside the same take does not drop earlier words.
+   * This is not a cue to translate — the caller translates once, after halt().
    */
-  onParts: (parts: SpeechPart[]) => void
+  onTranscript: (transcript: string) => void
   onError: (message: string) => void
   onStart: () => void
   onEnd: () => void
@@ -41,22 +31,21 @@ export interface RecognitionController {
   /** Call from a user gesture so the browser allows the microphone. */
   start: () => void
   /**
-   * End this session now. Results that arrive afterward are dropped.
-   * This instance will not auto-restart.
+   * Abort this take. Later results are dropped and this instance will not restart.
+   * Chrome often ignores stop()/abort() while the engine is still "starting";
+   * halt() aborts again from onstart so the mic cannot outlive the stopped button.
    */
   halt: () => void
+  /** Words heard in this take so far. Read this before halt() when the user stops. */
+  transcript: () => string
 }
 
 function norm(text: string): string {
   return text.replace(/\s+/g, ' ').trim()
 }
 
-function hasWords(text: string): boolean {
-  return /[\p{L}\p{N}]/u.test(text)
-}
-
-/** Join result transcripts. Does not decide which results belong to this sentence. */
-export function phraseText(parts: readonly SpeechPart[], fromIndex: number): string {
+/** Join result transcripts of one engine session. */
+function phraseText(parts: readonly SpeechPart[], fromIndex: number): string {
   let full = ''
   const start = fromIndex > 0 ? fromIndex : 0
   for (let i = start; i < parts.length; i++) {
@@ -68,44 +57,16 @@ export function phraseText(parts: readonly SpeechPart[], fromIndex: number): str
   return norm(full)
 }
 
-function joinSentence(base: string, extra: string): string {
-  const left = norm(base)
-  const right = norm(extra)
-  const leftOk = hasWords(left)
-  const rightOk = hasWords(right)
-  if (!leftOk && !rightOk) return ''
-  if (!leftOk) return right
-  if (!rightOk) return left
-  return `${left} ${right}`
+function sessionTranscript(parts: readonly SpeechPart[]): string {
+  return phraseText(parts, 0)
 }
 
-/**
- * The sentence still waiting to be translated.
- * Results before the anchor are already committed. A growth or rewrite of
- * `parts[anchor.index]` is kept — that is the same result Chrome revises.
- */
-export function currentSentence(parts: readonly SpeechPart[], anchor: PhraseAnchor): string {
-  const index = anchor.index > 0 ? anchor.index : 0
-  if (index >= parts.length) return ''
-  if (anchor.taken === null) return phraseText(parts, index)
-
-  const head = norm(parts[index]?.transcript ?? '')
-  const taken = norm(anchor.taken)
-  const rest = phraseText(parts, index + 1)
-  if (!head || head === taken) return rest
-
-  const headKey = head.toLocaleLowerCase()
-  const takenKey = taken.toLocaleLowerCase()
-  if (taken && headKey.startsWith(takenKey)) {
-    const extra =
-      head.length === headKey.length && taken.length === takenKey.length
-        ? head.slice(taken.length)
-        : headKey.slice(takenKey.length)
-    return joinSentence(extra, rest)
-  }
-
-  // Not a prefix: Chrome replaced this result. Keep the new words.
-  return joinSentence(head, rest)
+function joinTranscript(left: string, right: string): string {
+  const a = norm(left)
+  const b = norm(right)
+  if (!a) return b
+  if (!b) return a
+  return `${a} ${b}`
 }
 
 function snapshot(event: SpeechRecognitionEvent): SpeechPart[] {
@@ -135,14 +96,11 @@ function forceAbort(recognition: SpeechRecognition) {
 }
 
 /**
- * Continuous recognition with interim results.
- * Unexpected end restarts only while `shouldRun` is true and halt() was not called.
- * Do not stop the engine on a sentence pause — that cuts the speaker off.
- * The UI translates after ~1.1s of an unchanged sentence instead.
- *
- * Chrome ignores stop()/abort() in the "starting" state, then delivers onstart
- * and keeps the mic. halt() prefers abort(), and onstart aborts again if the
- * session was already given up so the mic cannot outlive the muted UI.
+ * One user take: continuous recognition with interim results, until halt().
+ * A pause does not stop the mic and does not mean a sentence is finished.
+ * If the engine ends on its own, it restarts only while `shouldRun` is still
+ * true (the caller's generation) and halt() was not called. Words from those
+ * sessions stay on the same transcript.
  */
 export function createRecognition(
   lang: string,
@@ -159,7 +117,17 @@ export function createRecognition(
   recognition.maxAlternatives = 1
 
   let halted = false
+  let sealed = ''
+  let live = ''
   const givenUp = () => halted || !shouldRun()
+  const current = () => joinTranscript(sealed, live)
+
+  const sealSession = () => {
+    const chunk = norm(live)
+    live = ''
+    if (!chunk) return
+    sealed = joinTranscript(sealed, chunk)
+  }
 
   recognition.onstart = () => {
     if (givenUp()) {
@@ -173,7 +141,10 @@ export function createRecognition(
     if (givenUp()) return
     const parts = snapshot(event)
     if (parts.length === 0) return
-    handlers.onParts(parts)
+    live = sessionTranscript(parts)
+    const text = current()
+    if (!text) return
+    handlers.onTranscript(text)
   }
 
   recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
@@ -192,6 +163,8 @@ export function createRecognition(
   }
 
   recognition.onend = () => {
+    // Keep words before a restart replaces the result list.
+    sealSession()
     handlers.onEnd()
     if (givenUp()) return
     try {
@@ -209,6 +182,9 @@ export function createRecognition(
     halt() {
       halted = true
       forceAbort(recognition)
+    },
+    transcript() {
+      return current()
     },
   }
 }
