@@ -1,22 +1,42 @@
 import { useEffect, useRef, useState } from 'react'
 import { DEFAULT_LISTEN, DEFAULT_TARGET, LANGUAGES } from './lib/languages'
-import { createRecognition, isSpeechRecognitionSupported, phraseText } from './lib/speech'
-import type { RecognitionController, SpeechPart } from './lib/speech'
+import { createRecognition, currentSentence, isSpeechRecognitionSupported } from './lib/speech'
+import type { PhraseAnchor, RecognitionController, SpeechPart } from './lib/speech'
 import { translate } from './lib/translate'
 import { Privacy } from './pages/Privacy'
 
 /**
- * A phrase ends when the heard line has been still for this long, or on mute.
- * Not on every interim tick, and not by restarting recognition.
+ * A sentence ends when the heard line has been still for this long, or on mute.
+ * Long enough that a mid-word interim tick is not its own translation.
+ * Not on every interim result, and not by restarting recognition.
  */
-const PAUSE_MS = 600
+const PAUSE_MS = 1100
 const HISTORY_MAX = 2
+const RETRY_MAX_MS = 8000
 
 type Page = 'home' | 'privacy'
 
 interface HistoryItem {
   id: string
   translation: string
+}
+
+interface Slot {
+  id: number
+  source: string
+  status: 'pending' | 'ready'
+  text: string
+  inflight: boolean
+  attempts: number
+  retryTimer: number | null
+}
+
+function emptyAnchor(): PhraseAnchor {
+  return { index: 0, taken: null }
+}
+
+function hasWords(text: string): boolean {
+  return /[\p{L}\p{N}]/u.test(text)
 }
 
 function OrbMark({ live, muted }: { live: boolean; muted?: boolean }) {
@@ -53,22 +73,23 @@ export default function App() {
   const heardRef = useRef('')
   const settledSourceRef = useRef('')
   const settledTranslationRef = useRef('')
-  // Bumped when the heard line changes so a slower earlier translate() cannot paint over a newer line.
+  // Bumped when the heard line changes so a slower earlier pause cannot commit a stale line.
   const requestGenRef = useRef(0)
   const pendingLineRef = useRef('')
   /**
-   * Phrases committed on a pause/mute, translated in order.
-   * A later result can return first; it waits so the screen does not skip a phrase.
+   * Sentences committed on a pause/mute, translated in order.
+   * A failure stays pending and is retried — it is not skipped.
    */
-  const slotsRef = useRef<Map<number, { source: string; status: 'pending' | 'ready' | 'skip'; text: string }>>(
-    new Map(),
-  )
+  const slotsRef = useRef<Map<number, Slot>>(new Map())
   const nextSlotRef = useRef(1)
   const slotSeqRef = useRef(0)
   const pauseTimerRef = useRef<number | null>(null)
   const partsRef = useRef<SpeechPart[]>([])
-  /** Results before this index already belong to earlier phrases in this session. */
-  const consumedRef = useRef(0)
+  /**
+   * Parks on the last result Chrome may still rewrite, plus the transcript
+   * already sent. Not `parts.length`, which drops an in-place revision.
+   */
+  const anchorRef = useRef<PhraseAnchor>(emptyAnchor())
   const sessionIdRef = useRef(0)
   const seqRef = useRef(0)
   const aliveRef = useRef(true)
@@ -108,17 +129,62 @@ export default function App() {
     setError(null)
   }
 
+  function sealAnchor(sessionId: number) {
+    if (sessionIdRef.current !== sessionId) return
+    const parts = partsRef.current
+    if (parts.length === 0) return
+    const last = parts.length - 1
+    anchorRef.current = {
+      index: last,
+      taken: (parts[last]?.transcript ?? '').replace(/\s+/g, ' ').trim(),
+    }
+  }
+
   function openSlot(source: string): number {
     const id = ++slotSeqRef.current
-    slotsRef.current.set(id, { source, status: 'pending', text: '' })
+    slotsRef.current.set(id, {
+      id,
+      source,
+      status: 'pending',
+      text: '',
+      inflight: false,
+      attempts: 0,
+      retryTimer: null,
+    })
     return id
+  }
+
+  function findPending(source: string): Slot | undefined {
+    for (const slot of slotsRef.current.values()) {
+      if (slot.status === 'pending' && slot.source === source) return slot
+    }
+    return undefined
+  }
+
+  function headSlot(): Slot | undefined {
+    let id = nextSlotRef.current
+    while (id <= slotSeqRef.current) {
+      const slot = slotsRef.current.get(id)
+      if (slot) return slot
+      id += 1
+    }
+    return undefined
   }
 
   function flushSlots() {
     let id = nextSlotRef.current
-    while (true) {
+    while (id <= slotSeqRef.current) {
       const slot = slotsRef.current.get(id)
-      if (!slot || slot.status === 'pending') return
+      if (!slot) {
+        id += 1
+        nextSlotRef.current = id
+        continue
+      }
+      if (slot.status === 'pending') return
+      if (slot.retryTimer !== null) {
+        window.clearTimeout(slot.retryTimer)
+        slot.retryTimer = null
+      }
       slotsRef.current.delete(id)
       nextSlotRef.current = id + 1
       if (
@@ -132,33 +198,94 @@ export default function App() {
     }
   }
 
-  function finishSlot(id: number, status: 'ready' | 'skip', translated = '') {
-    const slot = slotsRef.current.get(id)
-    if (!slot || slot.status !== 'pending') return
-    slot.status = status
-    slot.text = translated
+  function scheduleRetry(slotId: number) {
+    const slot = slotsRef.current.get(slotId)
+    if (!slot || slot.status !== 'pending' || slot.inflight) return
+    if (slot.retryTimer !== null) return
+    slot.attempts += 1
+    const delay = Math.min(PAUSE_MS * slot.attempts, RETRY_MAX_MS)
+    slot.retryTimer = window.setTimeout(() => {
+      const current = slotsRef.current.get(slotId)
+      if (!current) return
+      current.retryTimer = null
+      if (!aliveRef.current || current.status !== 'pending') return
+      void runTranslate(slotId)
+    }, delay)
+  }
+
+  function nudgeHead() {
+    const head = headSlot()
+    if (!head || head.status !== 'pending' || head.inflight) return
+    if (head.retryTimer !== null) {
+      window.clearTimeout(head.retryTimer)
+      head.retryTimer = null
+    }
+    void runTranslate(head.id)
+  }
+
+  function showFailedSentence(slotId: number, text: string, message: string) {
+    setError(message)
+    const live = currentSentence(partsRef.current, anchorRef.current).trim()
+    // While the next sentence is already being said, keep that quiet line.
+    if (live) return
+    for (const slot of slotsRef.current.values()) {
+      if (slot.id > slotId) return
+    }
+    // Nothing newer: the failed sentence stays readable, and the next pause retries it.
+    heardRef.current = text
+    setHeard(text)
+  }
+
+  async function runTranslate(slotId: number) {
+    const slot = slotsRef.current.get(slotId)
+    if (!slot || slot.status !== 'pending' || slot.inflight) return
+    slot.inflight = true
+    if (slot.retryTimer !== null) {
+      window.clearTimeout(slot.retryTimer)
+      slot.retryTimer = null
+    }
+    const text = slot.source
+    const result = await translate(text, listenLangRef.current, targetLangRef.current)
+    if (!aliveRef.current) return
+    const current = slotsRef.current.get(slotId)
+    if (!current || current.status !== 'pending') return
+    current.inflight = false
+    if (!result.ok) {
+      showFailedSentence(slotId, text, result.message)
+      scheduleRetry(slotId)
+      return
+    }
+    current.status = 'ready'
+    current.text = result.text
     flushSlots()
   }
 
-  async function translateSlot(text: string, slotId: number) {
-    const result = await translate(text, listenLangRef.current, targetLangRef.current)
-    if (!aliveRef.current) return
-    if (!result.ok) {
-      if (heardRef.current === text) setError(result.message)
-      finishSlot(slotId, 'skip')
+  /**
+   * Queue one finished sentence. Later sentences wait so a slow reply cannot skip this one.
+   * The anchor moves onto the result Chrome may still revise, not past it.
+   */
+  function commitSentence(text: string, gen: number, sessionId: number) {
+    const trimmed = text.trim()
+    if (!trimmed || !hasWords(trimmed)) return
+    if (gen !== requestGenRef.current) return
+
+    if (trimmed === settledSourceRef.current && settledTranslationRef.current) {
+      sealAnchor(sessionId)
       return
     }
-    finishSlot(slotId, 'ready', result.text)
-  }
 
-  /** Queue one finished phrase. Later phrases wait so a slow reply cannot skip this one. */
-  function commitLine(line: string, gen: number) {
-    const text = line.trim()
-    if (!text) return
-    if (gen !== requestGenRef.current) return
-    if (text === settledSourceRef.current && settledTranslationRef.current) return
-    const slotId = openSlot(text)
-    void translateSlot(text, slotId)
+    const existing = findPending(trimmed)
+    if (existing) {
+      sealAnchor(sessionId)
+      if (!existing.inflight && existing.retryTimer === null) scheduleRetry(existing.id)
+      nudgeHead()
+      return
+    }
+
+    sealAnchor(sessionId)
+    const id = openSlot(trimmed)
+    void runTranslate(id)
+    nudgeHead()
   }
 
   function schedulePause(line: string) {
@@ -167,15 +294,14 @@ export default function App() {
     clearPause()
     pendingLineRef.current = line
     const gen = requestGenRef.current
-    const boundary = partsRef.current.length
     const sessionId = sessionIdRef.current
     pauseTimerRef.current = window.setTimeout(() => {
       pauseTimerRef.current = null
-      // Only this session's cursor. A Chrome restart has a fresh result list.
-      if (sessionIdRef.current === sessionId && consumedRef.current < boundary) {
-        consumedRef.current = boundary
-      }
-      commitLine(line, gen)
+      if (gen !== requestGenRef.current) return
+      const sameSession = sessionIdRef.current === sessionId
+      const live = sameSession ? currentSentence(partsRef.current, anchorRef.current).trim() : ''
+      const sentence = sameSession && live ? live : line
+      commitSentence(sentence, gen, sessionId)
     }, PAUSE_MS)
   }
 
@@ -190,19 +316,20 @@ export default function App() {
 
   function handleParts(parts: SpeechPart[]) {
     if (!wantListenRef.current) return
+    // A restarted session has a fresh list. Don't read it through the old anchor.
+    if (anchorRef.current.index >= parts.length) {
+      anchorRef.current = emptyAnchor()
+    }
     partsRef.current = parts
-    const line = phraseText(parts, consumedRef.current)
+    const line = currentSentence(parts, anchorRef.current).trim()
     if (!line) return
     presentLine(line)
   }
 
   function stopListening() {
-    const line = heardRef.current.trim()
+    const live = currentSentence(partsRef.current, anchorRef.current).trim()
     const gen = requestGenRef.current
-    const boundary = partsRef.current.length
     const sessionId = sessionIdRef.current
-    const needsTail =
-      Boolean(line) && !(line === settledSourceRef.current && settledTranslationRef.current)
 
     // Epoch first: a result already queued, or onend's restart, no longer matches.
     listenEpochRef.current += 1
@@ -214,12 +341,9 @@ export default function App() {
     recognitionRef.current = null
     rec?.halt()
 
-    if (sessionIdRef.current === sessionId && consumedRef.current < boundary) {
-      consumedRef.current = boundary
-    }
-
-    // Mute is not how you ask for a translation; this only keeps a trailing phrase.
-    if (needsTail) commitLine(line, gen)
+    // Mute keeps the trailing sentence. It does not abort recognition on a mere pause.
+    if (live) commitSentence(live, gen, sessionId)
+    else nudgeHead()
   }
 
   function startListening(): boolean {
@@ -232,7 +356,7 @@ export default function App() {
     const epoch = ++listenEpochRef.current
     wantListenRef.current = true
     sessionIdRef.current += 1
-    consumedRef.current = 0
+    anchorRef.current = emptyAnchor()
     partsRef.current = []
     setError(null)
 
@@ -244,7 +368,7 @@ export default function App() {
           if (listenEpochRef.current !== epoch || !wantListenRef.current) return
           setListening(true)
           sessionIdRef.current += 1
-          consumedRef.current = 0
+          anchorRef.current = emptyAnchor()
           partsRef.current = []
         },
         onEnd: () => {
@@ -331,6 +455,8 @@ export default function App() {
 
   useEffect(() => {
     aliveRef.current = true
+    // Same Map for the lifetime of this mount; read it here so cleanup does not touch the ref.
+    const slots = slotsRef.current
     return () => {
       aliveRef.current = false
       wantListenRef.current = false
@@ -338,6 +464,12 @@ export default function App() {
       if (pauseTimerRef.current !== null) {
         window.clearTimeout(pauseTimerRef.current)
         pauseTimerRef.current = null
+      }
+      for (const slot of slots.values()) {
+        if (slot.retryTimer !== null) {
+          window.clearTimeout(slot.retryTimer)
+          slot.retryTimer = null
+        }
       }
       const rec = recognitionRef.current
       recognitionRef.current = null

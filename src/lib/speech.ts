@@ -15,10 +15,21 @@ export interface SpeechPart {
   isFinal: boolean
 }
 
+/**
+ * Where the current sentence starts in the session result list.
+ * `taken` is the transcript of `parts[index]` already sent to translation.
+ * Chrome often rewrites that same index in place; a length cursor (`parts.length`)
+ * skips those words. A null `taken` means the index has not been committed yet.
+ */
+export interface PhraseAnchor {
+  index: number
+  taken: string | null
+}
+
 export interface RecognitionHandlers {
   /**
    * The session's result list, item by item.
-   * The UI keeps only the slice after the last committed phrase.
+   * The UI keeps the uncommitted sentence, including a rewrite of the boundary result.
    */
   onParts: (parts: SpeechPart[]) => void
   onError: (message: string) => void
@@ -36,10 +47,15 @@ export interface RecognitionController {
   halt: () => void
 }
 
-/**
- * Transcript of results[fromIndex..]. That slice is one phrase once earlier
- * results have been consumed. Never falls back to the whole session.
- */
+function norm(text: string): string {
+  return text.replace(/\s+/g, ' ').trim()
+}
+
+function hasWords(text: string): boolean {
+  return /[\p{L}\p{N}]/u.test(text)
+}
+
+/** Join result transcripts. Does not decide which results belong to this sentence. */
 export function phraseText(parts: readonly SpeechPart[], fromIndex: number): string {
   let full = ''
   const start = fromIndex > 0 ? fromIndex : 0
@@ -49,7 +65,47 @@ export function phraseText(parts: readonly SpeechPart[], fromIndex: number): str
     if (full && !/\s$/.test(full) && !/^\s/.test(chunk)) full += ' '
     full += chunk
   }
-  return full.replace(/\s+/g, ' ').trim()
+  return norm(full)
+}
+
+function joinSentence(base: string, extra: string): string {
+  const left = norm(base)
+  const right = norm(extra)
+  const leftOk = hasWords(left)
+  const rightOk = hasWords(right)
+  if (!leftOk && !rightOk) return ''
+  if (!leftOk) return right
+  if (!rightOk) return left
+  return `${left} ${right}`
+}
+
+/**
+ * The sentence still waiting to be translated.
+ * Results before the anchor are already committed. A growth or rewrite of
+ * `parts[anchor.index]` is kept — that is the same result Chrome revises.
+ */
+export function currentSentence(parts: readonly SpeechPart[], anchor: PhraseAnchor): string {
+  const index = anchor.index > 0 ? anchor.index : 0
+  if (index >= parts.length) return ''
+  if (anchor.taken === null) return phraseText(parts, index)
+
+  const head = norm(parts[index]?.transcript ?? '')
+  const taken = norm(anchor.taken)
+  const rest = phraseText(parts, index + 1)
+  if (!head || head === taken) return rest
+
+  const headKey = head.toLocaleLowerCase()
+  const takenKey = taken.toLocaleLowerCase()
+  if (taken && headKey.startsWith(takenKey)) {
+    const extra =
+      head.length === headKey.length && taken.length === takenKey.length
+        ? head.slice(taken.length)
+        : headKey.slice(takenKey.length)
+    return joinSentence(extra, rest)
+  }
+
+  // Not a prefix: Chrome replaced this result. Keep the new words.
+  return joinSentence(head, rest)
 }
 
 function snapshot(event: SpeechRecognitionEvent): SpeechPart[] {
@@ -81,8 +137,8 @@ function forceAbort(recognition: SpeechRecognition) {
 /**
  * Continuous recognition with interim results.
  * Unexpected end restarts only while `shouldRun` is true and halt() was not called.
- * Do not stop the engine on a pause timer — that cuts the speaker off.
- * The UI slices a phrase after ~600ms of silence instead.
+ * Do not stop the engine on a sentence pause — that cuts the speaker off.
+ * The UI translates after ~1.1s of an unchanged sentence instead.
  *
  * Chrome ignores stop()/abort() in the "starting" state, then delivers onstart
  * and keeps the mic. halt() prefers abort(), and onstart aborts again if the
